@@ -1,0 +1,43 @@
+# Environment & secrets
+.env
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Logs
+logs/*.log
+logs/*.log.*
+
+# Database
+*.db
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# PyInstaller
+*.spec
+
+
+# Extras
+codebase_summary_and_diagram.txt
