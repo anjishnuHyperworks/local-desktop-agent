@@ -16,7 +16,7 @@ import logging
 import threading
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QPoint, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QPoint, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QColor, QFont, QKeyEvent, QPainter, QPainterPath, QScreen
 from PyQt6.QtWidgets import (
     QApplication,
@@ -234,11 +234,51 @@ class SpotlightWindow(QWidget):
             return
         self._center_on_screen()
         self._input.clear()
+
         self.show()
         self.raise_()
-        self.activateWindow()
-        self._input.setFocus()
+
+        # Small delay + native focus forcing to beat Windows focus protection
+        QTimer.singleShot(50, self._force_native_window_focus)
         logger.debug("Spotlight shown")
+
+    def _force_native_window_focus(self) -> None:
+        """Aggressively acquire focus using Win32 APIs."""
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            hwnd = int(self.winId())
+            foreground_hwnd = user32.GetForegroundWindow()
+
+            if foreground_hwnd != hwnd:
+                foreground_thread = user32.GetWindowThreadProcessId(foreground_hwnd, None)
+                current_thread = kernel32.GetCurrentThreadId()
+
+                if foreground_thread != current_thread:
+                    user32.AttachThreadInput(current_thread, foreground_thread, True)
+                    user32.ShowWindow(hwnd, 5)  # SW_SHOW
+                    user32.SetForegroundWindow(hwnd)
+                    user32.SetFocus(hwnd)
+                    user32.AttachThreadInput(current_thread, foreground_thread, False)
+                else:
+                    user32.SetForegroundWindow(hwnd)
+                    user32.SetFocus(hwnd)
+
+            # Qt reinforcement
+            QApplication.setActiveWindow(self)
+            self.activateWindow()
+            self.raise_()
+            self._input.setFocus()
+            self._input.activateWindow()
+            self._input.selectAll()
+            logger.debug("Spotlight focus successfully forced via Win32 API")
+        except Exception as e:
+            logger.warning(f"Native focus injection failed (non-critical): {e}")
+            self.activateWindow()
+            self.raise_()
+            self._input.setFocus()
+            self._input.selectAll()
 
     def hide_spotlight(self) -> None:
         self.hide()
