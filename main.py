@@ -169,7 +169,7 @@ def main() -> None:
     # ---- Coordinator + worker thread ----------------------------------------
     # The Coordinator must NOT inherit QThread.  Instead, it is a QObject moved
     # into a dedicated worker thread so all its slot invocations run there.
-    coordinator = Coordinator(db=db, use_mock_ai=True)
+    coordinator = Coordinator(db=db, use_mock_ai=False)
 
     worker_thread = QThread()
     worker_thread.setObjectName("CoordinatorThread")

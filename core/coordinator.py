@@ -1,5 +1,5 @@
 """
-Phase 4: Core Coordinator
+Phase 5: Core Coordinator — Real Grok Vision API Integration
 
 The Coordinator is the central orchestrator of the automation loop.  It runs
 exclusively inside a dedicated QThread worker and communicates with the UI
@@ -28,18 +28,22 @@ Mock AI mode (Phase 4):
     This lets the entire pipeline — parser, DB, signals, state machine — be
     validated end-to-end without network access.
 
-Phase 5 upgrade path:
-    Replace get_ai_response() internals with real httpx calls.  Everything
-    else (loop skeleton, parser integration, DB logging, signals) stays unchanged.
+Phase 5:
+    use_mock_ai=False sends real httpx requests to the Grok Vision API.
+    Screenshot is captured, resized, base64-encoded, and sent alongside
+    conversation history and the system prompt.
 """
 
+import base64
 import logging
 import time
 from typing import Optional
 
+import httpx
 from PyQt6.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
 
 import config
+from automation.capture import ScreenCapture
 from core.database import InteractionDatabase
 from utils.image_processor import ImageProcessor
 from utils.parser import ActionParser, ActionType, ParsedAction
@@ -106,6 +110,7 @@ class Coordinator(QObject):
         self._db = db if db is not None else InteractionDatabase(config.DB_PATH)
         self._image_processor = ImageProcessor()
         self._parser = ActionParser()
+        self._screen_capture = ScreenCapture()
 
         # -- Execution state --------------------------------------------------
         self.is_running: bool = False
@@ -120,6 +125,9 @@ class Coordinator(QObject):
             "[TYPE:500,500|hello]",
             "[DONE]",
         ]
+
+        # Cache the system prompt text so we read the file once per session.
+        self._system_prompt: str = self._load_system_prompt()
 
         logger.info(
             "Coordinator created — use_mock_ai=%s, db=%s",
@@ -402,34 +410,158 @@ class Coordinator(QObject):
         """
         Return the next AI response string.
 
-        Phase 4 — mock mode:
+        Mock mode (use_mock_ai=True):
             Cycles through self._mock_responses in order.  After the list is
-            exhausted, returns "[DONE]" for every subsequent call, so the loop
-            always terminates cleanly.
+            exhausted, returns "[DONE]" for every subsequent call.
 
-        Phase 5 upgrade:
-            Replace the mock branch with an httpx call to the Grok Vision API.
-            The method signature and return type stay the same.
+        Real mode (use_mock_ai=False):
+            Captures a screenshot, resizes it, and sends a multi-turn payload
+            to the Grok Vision API.  Returns the model's text reply.
 
         Returns:
-            A string in the format Grok would return, containing exactly one
-            action tag at the end (or [DONE]).
+            A string containing exactly one action tag at the end (or [DONE]).
         """
         if self.use_mock_ai:
-            # Zero-based step index: current_step was already incremented.
             idx = self.current_step - 1
-            if idx < len(self._mock_responses):
-                response = self._mock_responses[idx]
-            else:
-                response = "[DONE]"
-
+            response = (
+                self._mock_responses[idx]
+                if idx < len(self._mock_responses)
+                else "[DONE]"
+            )
             logger.info(
                 "get_ai_response [MOCK, step=%d]: %r", self.current_step, response
             )
             return response
 
-        # Phase 5 placeholder — should not be reached in Phase 4.
-        logger.error(
-            "get_ai_response: use_mock_ai=False but real API not implemented yet"
+        return self._call_grok_api()
+
+    def _call_grok_api(self) -> str:
+        """
+        Perform a synchronous Grok Vision API call and return the response text.
+
+        Captures the screen, resizes the image, builds the message payload with
+        conversation history, and calls the API.  All errors are caught and a
+        safe fallback string is returned so the caller's loop never crashes.
+        """
+        fallback = "I couldn't process the screen. [DONE]"
+
+        # 1. Screenshot → optimised JPEG bytes.
+        try:
+            raw_jpeg = self._screen_capture.capture_jpeg_bytes()
+            processed = self._image_processor.resize_for_grok(raw_jpeg)
+            b64_image = base64.b64encode(processed.image_bytes).decode("utf-8")
+            logger.info(
+                "_call_grok_api: image captured — original=%dx%d, "
+                "resized=%dx%d, payload_size=%d bytes",
+                processed.original_width, processed.original_height,
+                processed.resized_width, processed.resized_height,
+                len(processed.image_bytes),
+            )
+        except Exception as exc:
+            logger.error("_call_grok_api: screen capture failed: %s", exc)
+            return fallback
+
+        # 2. Build message list.
+        history_context = self.build_history_context()
+
+        history_note = (
+            f"Previous steps summary:\n{history_context}\n\n"
+            if history_context
+            else ""
         )
-        return "[DONE]"
+
+        messages = [
+            {"role": "system", "content": self._system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"{history_note}"
+                            f"Current command: {self.current_command}"
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{b64_image}"
+                        },
+                    },
+                ],
+            },
+        ]
+
+        payload = {
+            "model": config.GROK_MODEL,
+            "messages": messages,
+        }
+
+        logger.info(
+            "_call_grok_api: sending request — model=%s, "
+            "history_chars=%d, image attached",
+            config.GROK_MODEL,
+            len(history_context),
+        )
+
+        # 3. HTTP call.
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                response = client.post(
+                    config.GROK_API_URL,
+                    json=payload,
+                    headers={"Authorization": f"Bearer {config.GROK_API_KEY}"},
+                )
+            response.raise_for_status()
+        except httpx.TimeoutException:
+            logger.error("_call_grok_api: request timed out (30s)")
+            return fallback
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "_call_grok_api: HTTP %d — %s",
+                exc.response.status_code,
+                exc.response.text[:300],
+            )
+            return fallback
+        except Exception as exc:
+            logger.error("_call_grok_api: unexpected error: %s", exc)
+            return fallback
+
+        # 4. Extract text from response.
+        try:
+            data = response.json()
+            text: str = data["choices"][0]["message"]["content"]
+            logger.info(
+                "_call_grok_api: received response (%d chars)", len(text)
+            )
+            return text
+        except Exception as exc:
+            logger.error(
+                "_call_grok_api: failed to parse response body: %s — raw: %s",
+                exc,
+                response.text[:300],
+            )
+            return fallback
+
+    # ------------------------------------------------------------------
+    # System prompt loader
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_system_prompt() -> str:
+        """Read the system prompt from disk, returning an empty string on failure."""
+        try:
+            text = config.SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+            logger.info(
+                "_load_system_prompt: loaded %d chars from %s",
+                len(text),
+                config.SYSTEM_PROMPT_PATH,
+            )
+            return text
+        except Exception as exc:
+            logger.error(
+                "_load_system_prompt: could not read %s: %s",
+                config.SYSTEM_PROMPT_PATH,
+                exc,
+            )
+            return ""
