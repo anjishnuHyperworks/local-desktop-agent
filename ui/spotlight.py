@@ -13,7 +13,6 @@ Threading model:
 """
 
 import logging
-import threading
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QPoint, pyqtSignal, QObject, QTimer
@@ -39,8 +38,7 @@ logger = logging.getLogger(__name__)
 # dispatched through Qt's queued connection mechanism.
 # ---------------------------------------------------------------------------
 class _SignalBridge(QObject):
-    show_window = pyqtSignal()
-    hide_window = pyqtSignal()
+    toggle_window = pyqtSignal()
     abort = pyqtSignal()
 
 
@@ -84,15 +82,12 @@ class SpotlightWindow(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self._bridge = _SignalBridge()
-        self._bridge.show_window.connect(self.show_spotlight)
-        self._bridge.hide_window.connect(self.hide_spotlight)
+        self._bridge.toggle_window.connect(self._handle_toggle)
         self._bridge.abort.connect(self._on_abort)
 
         self._executing = False   # True while the coordinator loop is running
         self._hotkey_listener: Optional[pynput_keyboard.GlobalHotKeys] = None
         self._abort_listener: Optional[pynput_keyboard.Listener] = None
-        self._esc_press_count = 0
-        self._esc_lock = threading.Lock()
 
         self._build_ui()
         self._start_hotkey_listener()
@@ -171,37 +166,30 @@ class SpotlightWindow(QWidget):
     def _start_hotkey_listener(self) -> None:
         def _on_activate() -> None:
             logger.debug("Hotkey fired")
-            if self.isVisible():
-                self._bridge.hide_window.emit()
-            else:
-                self._bridge.show_window.emit()
+            self._bridge.toggle_window.emit()
 
         self._hotkey_listener = pynput_keyboard.GlobalHotKeys(
-            {"<ctrl>+<space>": _on_activate}
+            {config.HOTKEY_COMBO: _on_activate}
         )
         self._hotkey_listener.daemon = True
         self._hotkey_listener.start()
         logger.debug("Global hotkey listener started")
 
+    def _handle_toggle(self) -> None:
+        """Safely check visibility and toggle on the Qt main thread."""
+        if self.isVisible():
+            self.hide_spotlight()
+        else:
+            self.show_spotlight()
+
     def _start_abort_listener(self) -> None:
-        """Start an Esc listener active only during execution."""
-        esc_key = pynput_keyboard.Key.esc
-
+        """Start Esc listener - single press aborts."""
         def _on_press(key: pynput_keyboard.Key) -> None:
-            if key == esc_key:
-                with self._esc_lock:
-                    self._esc_press_count += 1
-                    count = self._esc_press_count
-                if count >= 1:
-                    logger.info("Esc pressed — emitting abort signal")
-                    self._bridge.abort.emit()
+            if key == pynput_keyboard.Key.esc:
+                logger.info("Esc pressed - emitting abort signal")
+                self._bridge.abort.emit()
 
-        def _on_release(key: pynput_keyboard.Key) -> None:
-            pass
-
-        self._abort_listener = pynput_keyboard.Listener(
-            on_press=_on_press, on_release=_on_release
-        )
+        self._abort_listener = pynput_keyboard.Listener(on_press=_on_press)
         self._abort_listener.daemon = True
         self._abort_listener.start()
         logger.debug("Abort (Esc) listener started")
@@ -210,9 +198,6 @@ class SpotlightWindow(QWidget):
         if self._abort_listener and self._abort_listener.is_alive():
             self._abort_listener.stop()
             self._abort_listener = None
-        with self._esc_lock:
-            self._esc_press_count = 0
-
     # ------------------------------------------------------------------
     # Slot: Enter pressed in the input field
     # ------------------------------------------------------------------
