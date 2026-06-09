@@ -5,10 +5,16 @@ Must be run as Administrator on Windows for UAC-compatible input injection.
 """
 
 import sys
+import os
 import ctypes
 import logging
 import logging.handlers
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Silence Qt's internal complaints about duplicate DPI initialization
+# ---------------------------------------------------------------------------
+os.environ["QT_LOGGING_RULES"] = "qt.qpa.window=false"
 
 # ---------------------------------------------------------------------------
 # DPI Awareness — must be set before any UI or screen-measurement code runs.
@@ -139,9 +145,34 @@ def main() -> None:
             "The agent will start but may not function correctly until issues are resolved."
         )
 
-    # Phase 1 placeholder — subsequent phases will replace this with the Qt app launch.
-    logger.info("Agent skeleton initialised successfully. Phase 1 complete.")
-    logger.info("Next: implement UI Layer (Phase 2) in ui/spotlight.py")
+    # ------------------------------------------------------------------
+    # Phase 2: Qt application + Spotlight UI
+    # ------------------------------------------------------------------
+    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtCore import Qt
+    from ui.spotlight import SpotlightWindow
+
+    # Must be called before QApplication() is constructed
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)   # keep alive after window hides
+
+    window = SpotlightWindow()
+
+    # Placeholder: log submitted commands until Phase 4 wires up the coordinator.
+    def _on_command(text: str) -> None:
+        logger.info("Command received (coordinator not yet connected): %r", text)
+        # Mark execution complete immediately so the UI isn't stuck in executing mode.
+        window.mark_execution_complete()
+
+    window.command_submitted.connect(_on_command)
+    window.abort_requested.connect(lambda: logger.info("Abort requested"))
+
+    logger.info("Phase 2 complete — press Ctrl+Space to open the spotlight.")
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
