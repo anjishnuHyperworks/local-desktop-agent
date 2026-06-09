@@ -146,11 +146,13 @@ def main() -> None:
         )
 
     # ------------------------------------------------------------------
-    # Phase 2: Qt application + Spotlight UI
+    # Phase 2 + 4: Qt application + Spotlight UI + Coordinator
     # ------------------------------------------------------------------
     from PyQt6.QtWidgets import QApplication
-    from PyQt6.QtCore import Qt
+    from PyQt6.QtCore import Qt, QThread
     from ui.spotlight import SpotlightWindow
+    from core.database import InteractionDatabase
+    from core.coordinator import Coordinator
 
     # Must be called before QApplication() is constructed
     QApplication.setHighDpiScaleFactorRoundingPolicy(
@@ -160,18 +162,66 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)   # keep alive after window hides
 
+    # ---- Database -----------------------------------------------------------
+    db = InteractionDatabase(config.DB_PATH)
+    db.initialize()
+
+    # ---- Coordinator + worker thread ----------------------------------------
+    # The Coordinator must NOT inherit QThread.  Instead, it is a QObject moved
+    # into a dedicated worker thread so all its slot invocations run there.
+    coordinator = Coordinator(db=db, use_mock_ai=True)
+
+    worker_thread = QThread()
+    worker_thread.setObjectName("CoordinatorThread")
+    coordinator.moveToThread(worker_thread)
+    worker_thread.start()
+    logger.info("Coordinator worker thread started")
+
+    # ---- UI window ----------------------------------------------------------
     window = SpotlightWindow()
 
-    # Placeholder: log submitted commands until Phase 4 wires up the coordinator.
-    def _on_command(text: str) -> None:
-        logger.info("Command received (coordinator not yet connected): %r", text)
-        # Mark execution complete immediately so the UI isn't stuck in executing mode.
-        window.mark_execution_complete()
+    # ---- UI → Coordinator (queued, runs in worker thread) -------------------
+    window.command_submitted.connect(coordinator.start_command)
 
-    window.command_submitted.connect(_on_command)
-    window.abort_requested.connect(lambda: logger.info("Abort requested"))
+    # abort_requested is emitted by the Esc listener thread.  stop_command()
+    # only writes a boolean so a direct connection is safe across threads.
+    window.abort_requested.connect(coordinator.stop_command)
 
-    logger.info("Phase 2 complete — press Ctrl+Space to open the spotlight.")
+    # ---- Coordinator → UI (queued, runs in main/UI thread) ------------------
+    coordinator.finished_signal.connect(
+        lambda msg: (
+            logger.info("Task finished: %s", msg),
+            window.mark_execution_complete(),
+        )
+    )
+    coordinator.error_signal.connect(
+        lambda msg: (
+            logger.error("Task error: %s", msg),
+            window.mark_execution_complete(),
+        )
+    )
+    coordinator.abort_signal.connect(window.mark_execution_complete)
+    coordinator.status_signal.connect(
+        lambda msg: logger.info("Status: %s", msg)
+    )
+
+    # ---- Graceful teardown on app exit --------------------------------------
+    def _shutdown() -> None:
+        logger.info("Shutting down — stopping coordinator worker thread")
+        coordinator.stop_command()
+        worker_thread.quit()
+        if not worker_thread.wait(3000):
+            logger.warning("Worker thread did not stop within 3 s; terminating")
+            worker_thread.terminate()
+        db.close()
+        logger.info("Shutdown complete")
+
+    app.aboutToQuit.connect(_shutdown)
+
+    logger.info(
+        "Phase 4 ready — Coordinator wired up (mock_ai=True). "
+        "Press Ctrl+Space to open the spotlight."
+    )
     sys.exit(app.exec())
 
 

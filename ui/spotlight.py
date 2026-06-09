@@ -14,6 +14,8 @@ Threading model:
 
 import logging
 from typing import Optional
+import ctypes
+import time
 
 from PyQt6.QtCore import Qt, QPoint, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QColor, QFont, QKeyEvent, QPainter, QPainterPath, QScreen
@@ -176,7 +178,18 @@ class SpotlightWindow(QWidget):
         logger.debug("Global hotkey listener started")
 
     def _handle_toggle(self) -> None:
-        """Safely check visibility and toggle on the Qt main thread."""
+        """Safely check visibility and toggle on the Qt main thread with debouncing."""
+        current_time = time.time()
+
+        if not hasattr(self, "_last_toggle_time"):
+            self._last_toggle_time = 0.0
+
+        if current_time - self._last_toggle_time < 0.3:
+            logger.debug("Hotkey bounce or lingering Ctrl key detected and ignored.")
+            return
+
+        self._last_toggle_time = current_time
+
         if self.isVisible():
             self.hide_spotlight()
         else:
@@ -223,14 +236,13 @@ class SpotlightWindow(QWidget):
         self.show()
         self.raise_()
 
-        # Small delay + native focus forcing to beat Windows focus protection
-        QTimer.singleShot(50, self._force_native_window_focus)
+        # 0ms defers to the next event loop tick (after the native handle is realized)
+        QTimer.singleShot(0, self._force_native_window_focus)
         logger.debug("Spotlight shown")
 
     def _force_native_window_focus(self) -> None:
         """Aggressively acquire focus using Win32 APIs."""
         try:
-            import ctypes
             user32 = ctypes.windll.user32
             kernel32 = ctypes.windll.kernel32
             hwnd = int(self.winId())
