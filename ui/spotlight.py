@@ -50,7 +50,7 @@ class _SpotlightInput(QLineEdit):
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setPlaceholderText("What would you like to do?")
+        self.setPlaceholderText("Ahoy matey, what be the command?")
         self.setFont(QFont("Segoe UI", 16, QFont.Weight.Normal))
         self.setStyleSheet("""
             QLineEdit {
