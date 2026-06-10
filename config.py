@@ -22,8 +22,8 @@ SYSTEM_PROMPT_PATH = PROMPTS_DIR / "system_prompt.txt"
 # API
 # ---------------------------------------------------------------------------
 GROK_API_KEY: str = os.environ.get("GROK_API_KEY", "")
-GROK_API_URL: str = "https://openrouter.ai/api/v1/chat/completions"
-GROK_MODEL: str = "google/gemma-4-31b-it:free"
+GROK_API_URL: str = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+GROK_MODEL: str = "gemini-2.5-flash"
 
 # ---------------------------------------------------------------------------
 # Image / coordinate normalisation
