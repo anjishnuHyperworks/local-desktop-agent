@@ -44,6 +44,7 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
 
 import config
 from automation.capture import ScreenCapture
+from automation.input_emulator import InputEmulator
 from core.database import InteractionDatabase
 from utils.image_processor import ImageProcessor
 from utils.parser import ActionParser, ActionType, ParsedAction
@@ -111,6 +112,7 @@ class Coordinator(QObject):
         self._image_processor = ImageProcessor()
         self._parser = ActionParser()
         self._screen_capture = ScreenCapture()
+        self._input_emulator = InputEmulator()
 
         # -- Execution state --------------------------------------------------
         self.is_running: bool = False
@@ -202,6 +204,41 @@ class Coordinator(QObject):
         self.is_running = False
 
     # ------------------------------------------------------------------
+    # Action executor
+    # ------------------------------------------------------------------
+
+    def execute_action(self, action: ParsedAction) -> str:
+        """Execute parsed action. Returns 'success' or 'error'."""
+        if not action or action.action_type == ActionType.DONE:
+            return "success"
+
+        try:
+            logger.info("Executing action: %s", action)
+
+            if action.action_type == ActionType.CLICK:
+                self.status_signal.emit(f"Clicking at ({action.x}, {action.y})")
+                self._input_emulator.click_at(action.x, action.y)
+
+            elif action.action_type == ActionType.TYPE:
+                self.status_signal.emit(f"Typing at ({action.x}, {action.y})")
+                self._input_emulator.type_at_coordinates(action.x, action.y, action.text)
+
+            elif action.action_type == ActionType.PRESS:
+                self.status_signal.emit(f"Pressing key: {action.key}")
+                self._input_emulator.press_key(action.key)
+
+            elif action.action_type == ActionType.SCROLL:
+                self.status_signal.emit(f"Scrolling {action.direction} by {action.amount}")
+                self._input_emulator.scroll(action.direction, action.amount)
+
+            return "success"
+
+        except Exception as exc:
+            logger.error("Action execution failed: %s - %s", action, exc)
+            self.status_signal.emit(f"Action failed: {type(exc).__name__}")
+            return "error"
+
+    # ------------------------------------------------------------------
     # Main execution loop (runs entirely in the worker thread)
     # ------------------------------------------------------------------
 
@@ -218,6 +255,9 @@ class Coordinator(QObject):
         The loop emits status_signal at the start of each step so the UI can
         display progress in real time.
         """
+        # Allow Spotlight UI to fully hide before first screenshot
+        time.sleep(config.UI_HIDE_DELAY_MS / 1000.0)
+
         logger.info(
             "run_loop started — command=%r, max_steps=%d, mock=%s",
             self.current_command,
@@ -330,9 +370,14 @@ class Coordinator(QObject):
         self.status_signal.emit(status_msg)
         logger.info("process_single_step: %s", status_msg)
 
-        # 5. Persist interaction record.
+        # 5. Execute the action and record the result.
         action_tag_str = str(action) if action else None
-        execution_result = "pending"   # Phase 5+ will update this after execution.
+        if action is None:
+            execution_result = "skipped"
+        elif action.action_type == ActionType.DONE:
+            execution_result = "success"
+        else:
+            execution_result = self.execute_action(action)
 
         try:
             self._db.log_interaction(
