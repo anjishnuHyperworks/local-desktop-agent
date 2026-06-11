@@ -167,12 +167,93 @@ class Coordinator(QObject):
             QThread.currentThread().objectName() or "unnamed",
         )
 
+        self.is_running = True  # lock before classification to block concurrent commands
         self.current_command = command
         self.current_step = 0
-        self.is_running = True
 
-        self.status_signal.emit(f"Starting: {command}")
-        self.run_loop()
+        self.status_signal.emit("Analyzing intent...")
+
+        try:
+            intent = self.classify_intent(command)
+
+            if intent == "CHAT":
+                logger.info("Routing to Pure Chat handler.")
+                self.handle_pure_chat(command)
+            else:
+                logger.info("Routing to Desktop Automation loop.")
+                self.status_signal.emit(f"Starting automation: {command}")
+                # run_loop() manages is_running internally
+                self.run_loop()
+
+        except Exception as exc:
+            logger.exception("Fatal error during intent routing: %s", exc)
+            self.is_running = False
+            self.error_signal.emit(f"Failed to process command: {exc}")
+        # No finally: CHAT releases via handle_pure_chat(), AUTOMATION via run_loop()
+
+    def classify_intent(self, command: str) -> str:
+        """Determines if the command requires desktop automation or is purely text-based."""
+        if self.use_mock_ai:
+            return "AUTOMATION"
+
+        classification_prompt = (
+            "You are an intent router for a desktop automation agent.\n"
+            "Analyze the user's input and classify it into one of two categories:\n"
+            "1. AUTOMATION: If the user is asking to control the computer, click something, open an app, scroll, type, or find something on their screen.\n"
+            "2. CHAT: If the user is asking a general question, greeting you, asking for calculations, or having a casual conversation that doesn't require looking at their screen.\n\n"
+            "Output EXACTLY 'AUTOMATION' or 'CHAT'. Do not include any other text."
+        )
+
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                response = client.post(
+                    config.GROK_API_URL,
+                    json={
+                        "model": config.GROK_MODEL,
+                        "messages": [
+                            {"role": "system", "content": classification_prompt},
+                            {"role": "user", "content": command},
+                        ],
+                    },
+                    headers={"Authorization": f"Bearer {config.GROK_API_KEY}"},
+                )
+            response.raise_for_status()
+            result = response.json()["choices"][0]["message"]["content"].strip().upper()
+            return "CHAT" if "CHAT" in result else "AUTOMATION"
+        except Exception as exc:
+            logger.error("Intent classification failed, defaulting to AUTOMATION: %s", exc)
+            return "AUTOMATION"
+
+    def handle_pure_chat(self, command: str) -> None:
+        """Answers conversational questions directly without taking a screenshot."""
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.post(
+                    config.GROK_API_URL,
+                    json={
+                        "model": config.GROK_MODEL,
+                        "messages": [
+                            {"role": "system", "content": "You are a helpful desktop assistant. Answer the user's question concisely."},
+                            {"role": "user", "content": command},
+                        ],
+                    },
+                    headers={"Authorization": f"Bearer {config.GROK_API_KEY}"},
+                )
+            response.raise_for_status()
+            text = response.json()["choices"][0]["message"]["content"]
+
+            self._db.log_interaction(
+                user_command=command,
+                assistant_response=text,
+                action_tag="[DONE]",
+                execution_result="success",
+            )
+            self.status_signal.emit(text)
+            self.finished_signal.emit("Chat complete.")
+        except Exception as exc:
+            self.error_signal.emit(f"Failed to fetch chat response: {exc}")
+        finally:
+            self.is_running = False
 
     # ------------------------------------------------------------------
     # Slot: abort (called directly from UI/abort thread — flag write only)
