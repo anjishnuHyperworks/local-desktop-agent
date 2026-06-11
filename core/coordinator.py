@@ -213,8 +213,8 @@ class Coordinator(QObject):
         classification_prompt = (
             "You are an intent router for a desktop automation agent.\n"
             "Analyze the user's input and classify it into one of two categories:\n"
-            "1. AUTOMATION: If the user is asking to control the computer, click something, open an app, scroll, type, or find something on their screen.\n"
-            "2. CHAT: If the user is asking a general question, greeting you, asking for calculations, or having a casual conversation that doesn't require looking at their screen.\n\n"
+            "1. AUTOMATION: If the user is asking to control the computer (click, type, scroll, open an app), OR asking about what is currently on their screen (e.g. 'what's on the screen?', 'what do you see?', 'read the screen', 'what's open?', 'describe the screen').\n"
+            "2. CHAT: If the user is asking a general knowledge question, greeting you, asking for calculations, or having a casual conversation that has nothing to do with their current screen or computer state.\n\n"
             "Output EXACTLY 'AUTOMATION' or 'CHAT'. Do not include any other text."
         )
 

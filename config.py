@@ -21,9 +21,9 @@ SYSTEM_PROMPT_PATH = PROMPTS_DIR / "system_prompt.txt"
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
-GROK_API_KEY: str = os.environ.get("GROK_API_KEY", "")
-GROK_API_URL: str = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-GROK_MODEL: str = "gemini-2.5-flash"
+GROK_API_KEY: str = os.environ.get("AICREDITS_API_KEY", "")
+GROK_API_URL: str = "https://api.aicredits.in/v1/chat/completions"
+GROK_MODEL: str = "openai/gpt-4o-mini"
 
 # ---------------------------------------------------------------------------
 # Image / coordinate normalisation
