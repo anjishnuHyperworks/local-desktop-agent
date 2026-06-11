@@ -77,6 +77,22 @@ def _setup_logging() -> logging.Logger:
     console_handler.setFormatter(fmt)
     root.addHandler(console_handler)
 
+    # Dedicated latency log — all [latency] entries go here for easy analysis
+    perf_handler = logging.handlers.RotatingFileHandler(
+        config.LOGS_DIR / "latency.log",
+        maxBytes=2 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    perf_handler.setFormatter(logging.Formatter(
+        fmt="%(asctime)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    perf_logger = logging.getLogger("perf")
+    perf_logger.setLevel(logging.INFO)
+    perf_logger.addHandler(perf_handler)
+    perf_logger.propagate = False   # keep perf entries out of the main log
+
     return logging.getLogger(__name__)
 
 

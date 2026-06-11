@@ -14,6 +14,7 @@ Threading model:
 
 import html
 import logging
+import math
 from typing import Optional
 import ctypes
 import time
@@ -174,6 +175,14 @@ class SpotlightWindow(QWidget):
         self._response_panel.setOpenExternalLinks(True)
         self._response_panel.setFont(QFont("Segoe UI", 11))
         self._response_panel.setFrameShape(QFrame.Shape.NoFrame)
+        # Scrollbars are managed explicitly in _fit_window_to_content — the
+        # vertical one is enabled only when the answer exceeds the height cap.
+        self._response_panel.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._response_panel.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         self._response_panel.setStyleSheet("""
             QTextBrowser {
                 background: transparent;
@@ -203,20 +212,41 @@ class SpotlightWindow(QWidget):
         self._center_on_screen()
 
     def _set_expanded(self, expanded: bool) -> None:
-        """Grow the window downward to reveal the response panel, or collapse
-        it back to the bare input pill."""
+        """Grow the window downward to fit the response panel content, or
+        collapse it back to the bare input pill."""
         self._separator.setVisible(expanded)
         self._response_panel.setVisible(expanded)
-        height = (
-            config.SPOTLIGHT_EXPANDED_HEIGHT
-            if expanded
-            else config.SPOTLIGHT_HEIGHT + 20
+        if expanded:
+            self._fit_window_to_content()
+        else:
+            self.setFixedSize(config.SPOTLIGHT_WIDTH, config.SPOTLIGHT_HEIGHT + 20)
+
+    # Vertical chrome around the panel text: outer layout margins (8+8) +
+    # separator (1) + panel CSS padding (8+8) + document margin slack (6).
+    _PANEL_CHROME = 16 + 1 + 16 + 6
+
+    def _fit_window_to_content(self) -> None:
+        """Size the window to the answer, capped at the configured max —
+        beyond that the panel scrolls."""
+        doc = self._response_panel.document()
+        # Panel text width: window minus outer margins (20) and CSS side padding (28)
+        doc.setTextWidth(config.SPOTLIGHT_WIDTH - 48)
+        content_h = math.ceil(doc.size().height())
+        needed = config.SPOTLIGHT_HEIGHT + self._PANEL_CHROME + content_h
+        capped = needed > config.SPOTLIGHT_MAX_EXPANDED_HEIGHT
+        self._response_panel.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            if capped
+            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self.setFixedSize(config.SPOTLIGHT_WIDTH, height)
+        self.setFixedSize(
+            config.SPOTLIGHT_WIDTH,
+            min(needed, config.SPOTLIGHT_MAX_EXPANDED_HEIGHT),
+        )
 
     def _show_panel_html(self, html_text: str) -> None:
-        self._set_expanded(True)
         self._response_panel.setHtml(html_text)
+        self._set_expanded(True)
 
     def _center_on_screen(self) -> None:
         screen: QScreen = QApplication.primaryScreen()
@@ -322,8 +352,8 @@ class SpotlightWindow(QWidget):
             self.show()
             self.raise_()
             QTimer.singleShot(0, self._force_native_window_focus)
-        self._set_expanded(True)
         self._response_panel.setMarkdown(text)
+        self._set_expanded(True)
         self._input.setFocus()
         self._input.selectAll()
 

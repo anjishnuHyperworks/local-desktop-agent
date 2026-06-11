@@ -42,6 +42,8 @@ import logging
 import time
 from typing import Optional
 
+_perf = logging.getLogger("perf")
+
 import httpx
 from PyQt6.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
 
@@ -179,8 +181,14 @@ class Coordinator(QObject):
         self.status_signal.emit("Analyzing intent...")
 
         try:
+            _t0_command = time.perf_counter()
+
+            _t0 = time.perf_counter()
             intent = self.classify_intent(command)
+            _perf.info("[latency] intent_classification=%.3fs", time.perf_counter() - _t0)
+
             self.intent_signal.emit(intent)
+            self._command_start_time = _t0_command
 
             if intent == "CHAT":
                 logger.info("Routing to Pure Chat handler.")
@@ -233,6 +241,7 @@ class Coordinator(QObject):
     def handle_pure_chat(self, command: str) -> None:
         """Answers conversational questions directly without taking a screenshot."""
         try:
+            _t0 = time.perf_counter()
             with httpx.Client(timeout=10.0) as client:
                 response = client.post(
                     config.GROK_API_URL,
@@ -246,6 +255,7 @@ class Coordinator(QObject):
                     headers={"Authorization": f"Bearer {config.GROK_API_KEY}"},
                 )
             response.raise_for_status()
+            _perf.info("[latency] chat_api_call=%.3fs", time.perf_counter() - _t0)
             text = response.json()["choices"][0]["message"]["content"]
 
             self._db.log_interaction(
@@ -255,6 +265,8 @@ class Coordinator(QObject):
                 execution_result="success",
             )
             self.chat_response_signal.emit(text)
+            total = time.perf_counter() - getattr(self, "_command_start_time", _t0)
+            _perf.info("[latency] total_chat_command=%.3fs", total)
             self.finished_signal.emit("Chat complete.")
         except Exception as exc:
             self.error_signal.emit(f"Failed to fetch chat response: {exc}")
@@ -301,6 +313,7 @@ class Coordinator(QObject):
 
         try:
             logger.info("Executing action: %s", action)
+            _t0 = time.perf_counter()
 
             if action.action_type == ActionType.CLICK:
                 self.status_signal.emit(f"Clicking at ({action.x}, {action.y})")
@@ -318,6 +331,7 @@ class Coordinator(QObject):
                 self.status_signal.emit(f"Scrolling {action.direction} by {action.amount}")
                 self._input_emulator.scroll(action.direction, action.amount)
 
+            _perf.info("[latency] action_execution(%s)=%.3fs", action.action_type.name, time.perf_counter() - _t0)
             return "success"
 
         except Exception as exc:
@@ -345,6 +359,7 @@ class Coordinator(QObject):
         # Allow Spotlight UI to fully hide before first screenshot
         time.sleep(config.UI_HIDE_DELAY_MS / 1000.0)
 
+        _loop_start = time.perf_counter()
         logger.info(
             "run_loop started — command=%r, max_steps=%d, mock=%s",
             self.current_command,
@@ -375,6 +390,11 @@ class Coordinator(QObject):
                 if done:
                     # [DONE] received — normal completion.
                     logger.info("run_loop: [DONE] received — finishing normally")
+                    _perf.info(
+                        "[latency] total_automation_loop=%.3fs steps=%d",
+                        time.perf_counter() - _loop_start,
+                        self.current_step,
+                    )
                     self.is_running = False
                     self.finished_signal.emit("Task completed successfully.")
                     return
@@ -432,14 +452,20 @@ class Coordinator(QObject):
         Returns:
             True if the response contained [DONE], False otherwise.
         """
+        _t0_step = time.perf_counter()
+
         # 1. Load conversation history (text summaries only).
+        _t0 = time.perf_counter()
         history = self.build_history_context()
+        _perf.info("[latency] step=%d db_history_fetch=%.3fs", self.current_step, time.perf_counter() - _t0)
         logger.debug(
             "process_single_step: history context length=%d chars", len(history)
         )
 
         # 2. Get AI response (mock for Phase 4).
+        _t0 = time.perf_counter()
         raw_response = self.get_ai_response()
+        _perf.info("[latency] step=%d ai_response=%.3fs", self.current_step, time.perf_counter() - _t0)
         logger.info("AI response (step %d): %r", self.current_step, raw_response)
 
         # 3. Parse for action tag.
@@ -466,6 +492,7 @@ class Coordinator(QObject):
         else:
             execution_result = self.execute_action(action)
 
+        _t0 = time.perf_counter()
         try:
             self._db.log_interaction(
                 user_command=self.current_command if self.current_step == 1 else None,
@@ -478,6 +505,8 @@ class Coordinator(QObject):
             logger.error(
                 "process_single_step: DB log failed (non-fatal): %s", db_exc
             )
+        _perf.info("[latency] step=%d db_log=%.3fs", self.current_step, time.perf_counter() - _t0)
+        _perf.info("[latency] step=%d total_step=%.3fs", self.current_step, time.perf_counter() - _t0_step)
 
         # Return True on DONE, False to continue iterating.
         return action is not None and action.action_type == ActionType.DONE
@@ -579,9 +608,15 @@ class Coordinator(QObject):
 
         # 1. Screenshot → optimised JPEG bytes.
         try:
+            _t0 = time.perf_counter()
             raw_jpeg = self._screen_capture.capture_jpeg_bytes()
+            _perf.info("[latency] screenshot_capture=%.3fs", time.perf_counter() - _t0)
+
+            _t0 = time.perf_counter()
             processed = self._image_processor.resize_for_grok(raw_jpeg)
             b64_image = base64.b64encode(processed.image_bytes).decode("utf-8")
+            _perf.info("[latency] image_resize_encode=%.3fs", time.perf_counter() - _t0)
+
             logger.info(
                 "_call_grok_api: image captured — original=%dx%d, "
                 "resized=%dx%d, payload_size=%d bytes",
@@ -638,6 +673,7 @@ class Coordinator(QObject):
 
         # 3. HTTP call.
         try:
+            _t0 = time.perf_counter()
             with httpx.Client(timeout=30.0) as client:
                 response = client.post(
                     config.GROK_API_URL,
@@ -645,6 +681,7 @@ class Coordinator(QObject):
                     headers={"Authorization": f"Bearer {config.GROK_API_KEY}"},
                 )
             response.raise_for_status()
+            _perf.info("[latency] grok_http_call=%.3fs", time.perf_counter() - _t0)
         except httpx.TimeoutException:
             logger.error("_call_grok_api: request timed out (30s)")
             return fallback
