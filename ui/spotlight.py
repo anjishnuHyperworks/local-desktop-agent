@@ -92,6 +92,7 @@ class SpotlightWindow(QWidget):
         self._bridge.abort.connect(self._on_abort)
 
         self._executing = False   # True while the coordinator loop is running
+        self._stream_buffer: list[str] = []   # Accumulates streaming chat tokens
         self._hotkey_listener: Optional[pynput_keyboard.GlobalHotKeys] = None
         self._abort_listener: Optional[pynput_keyboard.Listener] = None
 
@@ -319,6 +320,7 @@ class SpotlightWindow(QWidget):
         # the intent: chat answers render in the response panel, automation
         # hides the window first (see on_intent_classified).
         self._executing = True
+        self._stream_buffer = []
         self._input.setReadOnly(True)
         self._show_panel_html(
             '<i style="color: rgba(255,255,255,0.45);">Thinking…</i>'
@@ -343,11 +345,10 @@ class SpotlightWindow(QWidget):
 
     @pyqtSlot(str)
     def show_chat_response(self, text: str) -> None:
-        """Render a chat answer in the response panel and hand focus back."""
+        """Render a complete chat answer in the response panel (non-streaming fallback)."""
         self._executing = False
         self._input.setReadOnly(False)
         if not self.isVisible():
-            # User dismissed the window while waiting — bring the answer back.
             self._center_on_screen()
             self.show()
             self.raise_()
@@ -356,6 +357,20 @@ class SpotlightWindow(QWidget):
         self._set_expanded(True)
         self._input.setFocus()
         self._input.selectAll()
+
+    @pyqtSlot(str)
+    def append_chat_token(self, token: str) -> None:
+        """Append a streaming token to the response panel, expanding it on first token."""
+        if not self._stream_buffer:
+            # First token — clear the "Thinking…" placeholder and expand panel.
+            self._response_panel.clear()
+            self._set_expanded(True)
+            if not self.isVisible():
+                self._center_on_screen()
+                self.show()
+                self.raise_()
+        self._stream_buffer.append(token)
+        self._response_panel.setMarkdown("".join(self._stream_buffer))
 
     @pyqtSlot(str)
     def on_task_error(self, msg: str) -> None:
@@ -442,6 +457,9 @@ class SpotlightWindow(QWidget):
         """Call this (via signal) when the coordinator loop finishes."""
         self._set_executing(False)
         self._input.setReadOnly(False)
+        if self.isVisible():
+            self._input.setFocus()
+            self._input.selectAll()
         logger.debug("Execution marked complete")
 
     # ------------------------------------------------------------------

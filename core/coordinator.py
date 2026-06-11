@@ -38,6 +38,7 @@ Phase 5:
 """
 
 import base64
+import json
 import logging
 import time
 from typing import Optional
@@ -93,7 +94,8 @@ class Coordinator(QObject):
     abort_signal         = pyqtSignal()      # User-requested abort (Esc)
     status_signal        = pyqtSignal(str)   # Live progress messages
     intent_signal        = pyqtSignal(str)   # "CHAT" | "AUTOMATION" per command
-    chat_response_signal = pyqtSignal(str)   # Answer text for pure-chat commands
+    chat_response_signal = pyqtSignal(str)   # Answer text for pure-chat commands (non-streaming fallback)
+    chat_token_signal    = pyqtSignal(str)   # Incremental token chunk for streaming chat
 
     # ------------------------------------------------------------------
     # Construction
@@ -239,32 +241,49 @@ class Coordinator(QObject):
             return "AUTOMATION"
 
     def handle_pure_chat(self, command: str) -> None:
-        """Answers conversational questions directly without taking a screenshot."""
+        """Streams a chat answer token-by-token via chat_token_signal."""
+        _t0 = time.perf_counter()
+        accumulated: list[str] = []
         try:
-            _t0 = time.perf_counter()
-            with httpx.Client(timeout=10.0) as client:
-                response = client.post(
+            with httpx.Client(timeout=30.0) as client:
+                with client.stream(
+                    "POST",
                     config.GROK_API_URL,
                     json={
                         "model": config.GROK_MODEL,
+                        "stream": True,
                         "messages": [
                             {"role": "system", "content": "You are a helpful desktop assistant. Answer the user's question concisely."},
                             {"role": "user", "content": command},
                         ],
                     },
                     headers={"Authorization": f"Bearer {config.GROK_API_KEY}"},
-                )
-            response.raise_for_status()
-            _perf.info("[latency] chat_api_call=%.3fs", time.perf_counter() - _t0)
-            text = response.json()["choices"][0]["message"]["content"]
+                ) as response:
+                    response.raise_for_status()
+                    _perf.info("[latency] chat_first_byte=%.3fs", time.perf_counter() - _t0)
+                    for line in response.iter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[5:].strip()
+                        if payload == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(payload)
+                            token = chunk["choices"][0]["delta"].get("content", "")
+                            if token:
+                                accumulated.append(token)
+                                self.chat_token_signal.emit(token)
+                        except Exception:
+                            pass
 
+            full_text = "".join(accumulated)
+            _perf.info("[latency] chat_api_call=%.3fs", time.perf_counter() - _t0)
             self._db.log_interaction(
                 user_command=command,
-                assistant_response=text,
+                assistant_response=full_text,
                 action_tag="[DONE]",
                 execution_result="success",
             )
-            self.chat_response_signal.emit(text)
             total = time.perf_counter() - getattr(self, "_command_start_time", _t0)
             _perf.info("[latency] total_chat_command=%.3fs", total)
             self.finished_signal.emit("Chat complete.")
@@ -671,16 +690,32 @@ class Coordinator(QObject):
             len(history_context),
         )
 
-        # 3. HTTP call.
+        # 3. Streaming HTTP call — accumulate SSE chunks.
+        payload["stream"] = True
+        accumulated: list[str] = []
         try:
             _t0 = time.perf_counter()
             with httpx.Client(timeout=30.0) as client:
-                response = client.post(
+                with client.stream(
+                    "POST",
                     config.GROK_API_URL,
                     json=payload,
                     headers={"Authorization": f"Bearer {config.GROK_API_KEY}"},
-                )
-            response.raise_for_status()
+                ) as response:
+                    response.raise_for_status()
+                    _perf.info("[latency] grok_first_byte=%.3fs", time.perf_counter() - _t0)
+                    for line in response.iter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        payload_str = line[5:].strip()
+                        if payload_str == "[DONE]":
+                            break
+                        try:
+                            token = json.loads(payload_str)["choices"][0]["delta"].get("content", "")
+                            if token:
+                                accumulated.append(token)
+                        except Exception:
+                            pass
             _perf.info("[latency] grok_http_call=%.3fs", time.perf_counter() - _t0)
         except httpx.TimeoutException:
             logger.error("_call_grok_api: request timed out (30s)")
@@ -696,21 +731,12 @@ class Coordinator(QObject):
             logger.error("_call_grok_api: unexpected error: %s", exc)
             return fallback
 
-        # 4. Extract text from response.
-        try:
-            data = response.json()
-            text: str = data["choices"][0]["message"]["content"]
-            logger.info(
-                "_call_grok_api: received response (%d chars)", len(text)
-            )
-            return text
-        except Exception as exc:
-            logger.error(
-                "_call_grok_api: failed to parse response body: %s — raw: %s",
-                exc,
-                response.text[:300],
-            )
+        text = "".join(accumulated)
+        if not text:
+            logger.error("_call_grok_api: empty response from stream")
             return fallback
+        logger.info("_call_grok_api: received response (%d chars)", len(text))
+        return text
 
     # ------------------------------------------------------------------
     # System prompt loader

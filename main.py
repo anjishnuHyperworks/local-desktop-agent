@@ -220,6 +220,7 @@ def main() -> None:
         lambda intent: hud.activate() if intent == "AUTOMATION" else None
     )
     coordinator.chat_response_signal.connect(window.show_chat_response)
+    coordinator.chat_token_signal.connect(window.append_chat_token)
 
     coordinator.finished_signal.connect(
         lambda msg: (
