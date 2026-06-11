@@ -19,14 +19,22 @@ import time
 
 # ---------------------------------------------------------------------------
 # DPI awareness must be set before any Win32 screen measurement.
-# Mirrors the init sequence in main.py.
+# Mirrors the updated init sequence in main.py.
 # ---------------------------------------------------------------------------
 import ctypes
 
 def _init_dpi() -> None:
     try:
+        # Try Windows 10 Creators Update context API first (forces override)
+        # -4 corresponds to DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(-4)
+        return
+    except Exception:
+        pass
+
+    try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except AttributeError:
+    except Exception:
         try:
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:

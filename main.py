@@ -18,15 +18,22 @@ os.environ["QT_LOGGING_RULES"] = "qt.qpa.window=false"
 
 # ---------------------------------------------------------------------------
 # DPI Awareness — must be set before any UI or screen-measurement code runs.
-# PROCESS_PER_MONITOR_DPI_AWARE (value 2) ensures all coordinate and dimension
-# queries return physical pixels regardless of display scaling factor.
+# Forces modern Per-Monitor v2 context layer (bypasses shell environment locks).
+# Ensures all coordinate queries return true physical pixels regardless of scaling.
 # ---------------------------------------------------------------------------
 def _init_dpi_awareness() -> None:
     try:
-        # SetProcessDpiAwareness(2) = PROCESS_PER_MONITOR_DPI_AWARE
+        # Force modern Windows 10 Creators Update context layer context first
+        # -4 corresponds to DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(-4)
+        return
+    except Exception:
+        pass
+
+    try:
+        # Fallback to older shcore API if context switching is unavailable
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except AttributeError:
-        # shcore not available on very old Windows builds — fall back silently
+    except Exception:
         try:
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
@@ -219,7 +226,7 @@ def main() -> None:
     app.aboutToQuit.connect(_shutdown)
 
     logger.info(
-        "Phase 4 ready — Coordinator wired up (mock_ai=True). "
+        "Phase 5 ready — Coordinator wired up (use_mock_ai=False). "
         "Press Ctrl+Space to open the spotlight."
     )
     sys.exit(app.exec())
