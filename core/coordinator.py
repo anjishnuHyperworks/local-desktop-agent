@@ -15,10 +15,13 @@ Threading model (mandatory for Phase 4+):
        boolean flag, which is safe.  It does NOT rely on queued signal delivery.
 
 Signal inventory (all emitted from the worker thread):
-    status_signal(str)   — progress updates shown in the UI status area
-    finished_signal(str) — task completed normally ([DONE] received)
-    error_signal(str)    — task ended due to an error or max-step overflow
-    abort_signal()       — task stopped because the user pressed Esc
+    status_signal(str)        — progress updates shown in the UI status area
+    intent_signal(str)        — "CHAT" or "AUTOMATION", emitted once per command
+                                after classification so the UI can pick a flow
+    chat_response_signal(str) — the answer text for a pure-chat command
+    finished_signal(str)      — task completed normally ([DONE] received)
+    error_signal(str)         — task ended due to an error or max-step overflow
+    abort_signal()            — task stopped because the user pressed Esc
 
 Mock AI mode (Phase 4):
     use_mock_ai=True replaces Grok API calls with a fixed script:
@@ -83,10 +86,12 @@ class Coordinator(QObject):
     # Public signals (emitted from worker thread → received on UI thread)
     # ------------------------------------------------------------------
 
-    finished_signal = pyqtSignal(str)   # Task completed successfully
-    error_signal    = pyqtSignal(str)   # Fatal error or max-step exceeded
-    abort_signal    = pyqtSignal()      # User-requested abort (Esc)
-    status_signal   = pyqtSignal(str)   # Live progress messages
+    finished_signal      = pyqtSignal(str)   # Task completed successfully
+    error_signal         = pyqtSignal(str)   # Fatal error or max-step exceeded
+    abort_signal         = pyqtSignal()      # User-requested abort (Esc)
+    status_signal        = pyqtSignal(str)   # Live progress messages
+    intent_signal        = pyqtSignal(str)   # "CHAT" | "AUTOMATION" per command
+    chat_response_signal = pyqtSignal(str)   # Answer text for pure-chat commands
 
     # ------------------------------------------------------------------
     # Construction
@@ -175,6 +180,7 @@ class Coordinator(QObject):
 
         try:
             intent = self.classify_intent(command)
+            self.intent_signal.emit(intent)
 
             if intent == "CHAT":
                 logger.info("Routing to Pure Chat handler.")
@@ -248,7 +254,7 @@ class Coordinator(QObject):
                 action_tag="[DONE]",
                 execution_result="success",
             )
-            self.status_signal.emit(text)
+            self.chat_response_signal.emit(text)
             self.finished_signal.emit("Chat complete.")
         except Exception as exc:
             self.error_signal.emit(f"Failed to fetch chat response: {exc}")

@@ -158,6 +158,7 @@ def main() -> None:
     from PyQt6.QtWidgets import QApplication
     from PyQt6.QtCore import Qt, QThread
     from ui.spotlight import SpotlightWindow
+    from ui.hud import StatusHUD
     from core.database import InteractionDatabase
     from core.coordinator import Coordinator
 
@@ -184,8 +185,9 @@ def main() -> None:
     worker_thread.start()
     logger.info("Coordinator worker thread started")
 
-    # ---- UI window ----------------------------------------------------------
+    # ---- UI windows ---------------------------------------------------------
     window = SpotlightWindow()
+    hud = StatusHUD()
 
     # ---- UI → Coordinator (queued, runs in worker thread) -------------------
     window.command_submitted.connect(coordinator.start_command)
@@ -195,21 +197,39 @@ def main() -> None:
     window.abort_requested.connect(coordinator.stop_command)
 
     # ---- Coordinator → UI (queued, runs in main/UI thread) ------------------
+    # Intent decides the flow: chat keeps the spotlight open (answer renders in
+    # its response panel); automation hides it and shows the HUD pill instead.
+    coordinator.intent_signal.connect(window.on_intent_classified)
+    coordinator.intent_signal.connect(
+        lambda intent: hud.activate() if intent == "AUTOMATION" else None
+    )
+    coordinator.chat_response_signal.connect(window.show_chat_response)
+
     coordinator.finished_signal.connect(
         lambda msg: (
             logger.info("Task finished: %s", msg),
             window.mark_execution_complete(),
+            hud.finish(msg),
         )
     )
     coordinator.error_signal.connect(
         lambda msg: (
             logger.error("Task error: %s", msg),
-            window.mark_execution_complete(),
+            window.on_task_error(msg),
+            hud.finish(msg),
         )
     )
-    coordinator.abort_signal.connect(window.mark_execution_complete)
+    coordinator.abort_signal.connect(
+        lambda: (
+            window.mark_execution_complete(),
+            hud.finish("Stopped by user."),
+        )
+    )
     coordinator.status_signal.connect(
-        lambda msg: logger.info("Status: %s", msg)
+        lambda msg: (
+            logger.info("Status: %s", msg),
+            hud.show_status(msg),
+        )
     )
 
     # ---- Graceful teardown on app exit --------------------------------------

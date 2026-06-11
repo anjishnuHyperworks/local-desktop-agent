@@ -62,6 +62,13 @@ HOTKEY_COMBO: str = "<ctrl>+<space>"   # pynput key combo string
 SPOTLIGHT_WIDTH: int = 680
 SPOTLIGHT_HEIGHT: int = 56
 SPOTLIGHT_OPACITY: float = 0.92
+SPOTLIGHT_EXPANDED_HEIGHT: int = 380   # window height when the chat response panel is open
+
+# Automation status HUD (small click-through pill shown while the agent works)
+HUD_WIDTH: int = 480
+HUD_HEIGHT: int = 44
+HUD_MARGIN_BOTTOM: int = 60      # distance from the bottom edge of the screen
+HUD_LINGER_MS: int = 3000        # final status stays visible this long before hiding
 
 # ---------------------------------------------------------------------------
 # Logging

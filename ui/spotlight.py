@@ -12,19 +12,22 @@ Threading model:
   - The coordinator (added in Phase 4) connects to command_submitted and abort_requested.
 """
 
+import html
 import logging
 from typing import Optional
 import ctypes
 import time
 
-from PyQt6.QtCore import Qt, QPoint, pyqtSignal, QObject, QTimer
+from PyQt6.QtCore import Qt, QPoint, pyqtSignal, pyqtSlot, QObject, QTimer
 from PyQt6.QtGui import QColor, QFont, QKeyEvent, QPainter, QPainterPath, QScreen
 from PyQt6.QtWidgets import (
     QApplication,
+    QFrame,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -129,30 +132,91 @@ class SpotlightWindow(QWidget):
         shadow.setColor(QColor(0, 0, 0, 160))
         self._container.setGraphicsEffect(shadow)
 
-        inner = QHBoxLayout(self._container)
-        inner.setContentsMargins(18, 0, 18, 0)
-        inner.setSpacing(10)
+        inner = QVBoxLayout(self._container)
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.setSpacing(0)
+
+        # --- Input row (always visible) -----------------------------------
+        input_row = QWidget(self._container)
+        input_row.setFixedHeight(config.SPOTLIGHT_HEIGHT)
+        row_layout = QHBoxLayout(input_row)
+        row_layout.setContentsMargins(18, 0, 18, 0)
+        row_layout.setSpacing(10)
 
         # Magnifying-glass icon
         icon_label = QLabel("⌕")
         icon_label.setFont(QFont("Segoe UI", 18))
         icon_label.setStyleSheet("color: rgba(255,255,255,0.45); padding-top:2px;")
         icon_label.setFixedWidth(28)
-        inner.addWidget(icon_label)
+        row_layout.addWidget(icon_label)
 
-        self._input = _SpotlightInput(self._container)
+        self._input = _SpotlightInput(input_row)
         self._input.returnPressed.connect(self._on_return_pressed)
-        inner.addWidget(self._input)
+        row_layout.addWidget(self._input)
 
         # Subtle "ESC to cancel" hint shown while executing
         self._esc_hint = QLabel("ESC to stop")
         self._esc_hint.setFont(QFont("Segoe UI", 10))
         self._esc_hint.setStyleSheet("color: rgba(255,255,255,0.30);")
         self._esc_hint.hide()
-        inner.addWidget(self._esc_hint)
+        row_layout.addWidget(self._esc_hint)
+
+        inner.addWidget(input_row)
+
+        # --- Response panel (chat answers; hidden while collapsed) --------
+        self._separator = QFrame(self._container)
+        self._separator.setFixedHeight(1)
+        self._separator.setStyleSheet("background: rgba(255,255,255,0.08); border: none;")
+        self._separator.hide()
+        inner.addWidget(self._separator)
+
+        self._response_panel = QTextBrowser(self._container)
+        self._response_panel.setOpenExternalLinks(True)
+        self._response_panel.setFont(QFont("Segoe UI", 11))
+        self._response_panel.setFrameShape(QFrame.Shape.NoFrame)
+        self._response_panel.setStyleSheet("""
+            QTextBrowser {
+                background: transparent;
+                border: none;
+                color: #E6E6E6;
+                padding: 8px 14px;
+                selection-background-color: rgba(100, 149, 237, 0.5);
+            }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 8px;
+                margin: 4px 2px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255, 255, 255, 0.18);
+                border-radius: 4px;
+                min-height: 24px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+        """)
+        self._response_panel.hide()
+        inner.addWidget(self._response_panel, stretch=1)
 
         outer.addWidget(self._container)
         self._center_on_screen()
+
+    def _set_expanded(self, expanded: bool) -> None:
+        """Grow the window downward to reveal the response panel, or collapse
+        it back to the bare input pill."""
+        self._separator.setVisible(expanded)
+        self._response_panel.setVisible(expanded)
+        height = (
+            config.SPOTLIGHT_EXPANDED_HEIGHT
+            if expanded
+            else config.SPOTLIGHT_HEIGHT + 20
+        )
+        self.setFixedSize(config.SPOTLIGHT_WIDTH, height)
+
+    def _show_panel_html(self, html_text: str) -> None:
+        self._set_expanded(True)
+        self._response_panel.setHtml(html_text)
 
     def _center_on_screen(self) -> None:
         screen: QScreen = QApplication.primaryScreen()
@@ -215,14 +279,64 @@ class SpotlightWindow(QWidget):
     # Slot: Enter pressed in the input field
     # ------------------------------------------------------------------
     def _on_return_pressed(self) -> None:
+        if self._executing:
+            return
         text = self._input.text().strip()
         if not text:
             return
         logger.info("Command submitted: %r", text)
-        self._input.clear()
+        # Stay visible in a "thinking" state until the coordinator classifies
+        # the intent: chat answers render in the response panel, automation
+        # hides the window first (see on_intent_classified).
+        self._executing = True
+        self._input.setReadOnly(True)
+        self._show_panel_html(
+            '<i style="color: rgba(255,255,255,0.45);">Thinking…</i>'
+        )
+        self.command_submitted.emit(text)
+
+    # ------------------------------------------------------------------
+    # Slots: coordinator feedback (queued connections from worker thread)
+    # ------------------------------------------------------------------
+    @pyqtSlot(str)
+    def on_intent_classified(self, intent: str) -> None:
+        """Pick the UX flow once the coordinator knows what the command is."""
+        if intent == "CHAT":
+            # Keep the thinking panel up; the answer arrives via
+            # show_chat_response shortly.
+            return
+        # Automation needs the screen clear for screenshots — hide the window
+        # and arm the Esc abort listener.
+        self._set_expanded(False)
         self.hide_spotlight()
         self._set_executing(True)
-        self.command_submitted.emit(text)
+
+    @pyqtSlot(str)
+    def show_chat_response(self, text: str) -> None:
+        """Render a chat answer in the response panel and hand focus back."""
+        self._executing = False
+        self._input.setReadOnly(False)
+        if not self.isVisible():
+            # User dismissed the window while waiting — bring the answer back.
+            self._center_on_screen()
+            self.show()
+            self.raise_()
+            QTimer.singleShot(0, self._force_native_window_focus)
+        self._set_expanded(True)
+        self._response_panel.setMarkdown(text)
+        self._input.setFocus()
+        self._input.selectAll()
+
+    @pyqtSlot(str)
+    def on_task_error(self, msg: str) -> None:
+        """Show task errors in the panel when the window is up (chat flow);
+        automation errors surface on the HUD instead."""
+        self.mark_execution_complete()
+        if self.isVisible():
+            self._show_panel_html(
+                f'<span style="color: #FF9B9B;">{html.escape(msg)}</span>'
+            )
+            self._input.setFocus()
 
     # ------------------------------------------------------------------
     # Slots: show / hide (always called on main thread via signal)
@@ -230,6 +344,7 @@ class SpotlightWindow(QWidget):
     def show_spotlight(self) -> None:
         if self._executing:
             return
+        self._set_expanded(False)
         self._center_on_screen()
         self._input.clear()
 
@@ -296,6 +411,7 @@ class SpotlightWindow(QWidget):
     def mark_execution_complete(self) -> None:
         """Call this (via signal) when the coordinator loop finishes."""
         self._set_executing(False)
+        self._input.setReadOnly(False)
         logger.debug("Execution marked complete")
 
     # ------------------------------------------------------------------

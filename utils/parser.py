@@ -105,7 +105,7 @@ _RE_PRESS = re.compile(r"\[PRESS:([\w\-]+)\]")
 _RE_SCROLL = re.compile(r"\[SCROLL:(up|down|left|right):(\d+)\]", re.IGNORECASE)
 
 # No capture groups
-_RE_DONE = re.compile(r"\[DONE\]")
+_RE_DONE = re.compile(r"\[DONE\]|\bDONE\s*$", re.IGNORECASE)
 
 # Ordered list of (pattern, ActionType) for the "find first tag" scan.
 _TAG_PATTERNS: list[tuple[re.Pattern, ActionType]] = [
@@ -118,7 +118,7 @@ _TAG_PATTERNS: list[tuple[re.Pattern, ActionType]] = [
 
 # Single pattern that matches ANY known tag (for extract_action_tag / remove_action_tag).
 _RE_ANY_TAG = re.compile(
-    r"\[(?:DONE|CLICK:\d+,\d+|TYPE:\d+,\d+\|[^\]]*|PRESS:[\w\-]+|SCROLL:(?:up|down|left|right):\d+)\]",
+    r"\[(?:DONE|CLICK:\d+,\d+|TYPE:\d+,\d+\|[^\]]*|PRESS:[\w\-]+|SCROLL:(?:up|down|left|right):\d+)\]|\bDONE\s*$",
     re.IGNORECASE,
 )
 
@@ -219,9 +219,9 @@ class ActionParser:
         Returns None if the tag format is invalid despite matching the broad
         _RE_ANY_TAG pattern (e.g. out-of-range numbers).
         """
-        tag_upper = tag.upper()
+        tag_upper = tag.upper().strip()
 
-        if tag_upper == "[DONE]":
+        if tag_upper == "[DONE]" or tag_upper == "DO_NE" or "DONE" in tag_upper:
             return ParsedAction(action_type=ActionType.DONE)
 
         if tag_upper.startswith("[CLICK:"):
