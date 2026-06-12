@@ -12,8 +12,10 @@ Supported tags:
     [SCROLL:direction:amount]    — scroll the wheel (down:3, up:300, …)
     [DONE]                       — task complete, no further action needed
 
-Parsing is intentionally strict:
-    - Whitespace inside tags is not tolerated (Grok is trained without it).
+Parsing is lenient about the bracket wrapper but strict about the payload:
+    - Smaller models frequently drop the opening "[" and/or closing "]"
+      (e.g. "Action: CLICK:150,45]"), so brackets are optional and modest
+      whitespace around delimiters is tolerated.
     - Unknown tag names return None rather than raising.
     - Malformed numeric fields return None rather than raising.
     - Only the FIRST recognised tag in the response is extracted.
@@ -92,33 +94,45 @@ class ParsedAction:
 # Regex patterns (compiled once at import time)
 # ---------------------------------------------------------------------------
 
+# Payload patterns (the part between the brackets). The full per-tag regexes
+# and the catch-all _RE_ANY_TAG are both composed from these strings so the
+# two can never drift out of sync.
+_P_CLICK  = r"CLICK:\s*(\d+)\s*,\s*(\d+)"
+_P_TYPE   = r"TYPE:\s*(\d+)\s*,\s*(\d+)\s*\|([^\]\n]*)"
+_P_PRESS  = r"PRESS:\s*([\w\-]+)"
+_P_SCROLL = r"SCROLL:\s*(up|down|left|right)\s*:\s*(\d+)"
+
+
+def _lenient(payload: str) -> str:
+    """Wrap a payload pattern in optional square brackets.
+
+    Smaller models frequently drop the opening "[" and/or the closing "]"
+    (e.g. "Action: CLICK:150,45]"); the \\b stops a bare keyword from matching
+    inside a longer word when the bracket is absent.
+    """
+    return r"\[?\b" + payload + r"\s*\]?"
+
+
 # Capture groups: x, y
-_RE_CLICK = re.compile(r"\[CLICK:(\d+),(\d+)\]")
+_RE_CLICK = re.compile(_lenient(_P_CLICK), re.IGNORECASE)
 
 # Capture groups: x, y, text  (text may be empty, may contain | chars internally)
-_RE_TYPE = re.compile(r"\[TYPE:(\d+),(\d+)\|([^\]]*)\]")
+_RE_TYPE = re.compile(_lenient(_P_TYPE), re.IGNORECASE)
 
 # Capture group: key_name (letters, digits, underscore, hyphen)
-_RE_PRESS = re.compile(r"\[PRESS:([\w\-]+)\]")
+_RE_PRESS = re.compile(_lenient(_P_PRESS), re.IGNORECASE)
 
 # Capture groups: direction, amount
-_RE_SCROLL = re.compile(r"\[SCROLL:(up|down|left|right):(\d+)\]", re.IGNORECASE)
+_RE_SCROLL = re.compile(_lenient(_P_SCROLL), re.IGNORECASE)
 
-# No capture groups
-_RE_DONE = re.compile(r"\[DONE\]|\bDONE\s*$", re.IGNORECASE)
-
-# Ordered list of (pattern, ActionType) for the "find first tag" scan.
-_TAG_PATTERNS: list[tuple[re.Pattern, ActionType]] = [
-    (_RE_DONE,   ActionType.DONE),
-    (_RE_CLICK,  ActionType.CLICK),
-    (_RE_TYPE,   ActionType.TYPE),
-    (_RE_PRESS,  ActionType.PRESS),
-    (_RE_SCROLL, ActionType.SCROLL),
-]
-
-# Single pattern that matches ANY known tag (for extract_action_tag / remove_action_tag).
+# Single pattern that matches ANY known tag (for extract_action_tag /
+# remove_action_tag). DONE keeps its stricter form: brackets required unless
+# it is the bare final word of the response.
 _RE_ANY_TAG = re.compile(
-    r"\[(?:DONE|CLICK:\d+,\d+|TYPE:\d+,\d+\|[^\]]*|PRESS:[\w\-]+|SCROLL:(?:up|down|left|right):\d+)\]|\bDONE\s*$",
+    "|".join(
+        [_lenient(p) for p in (_P_CLICK, _P_TYPE, _P_PRESS, _P_SCROLL)]
+        + [r"\[DONE\]", r"\bDONE\s*$"]
+    ),
     re.IGNORECASE,
 )
 
@@ -219,21 +233,23 @@ class ActionParser:
         Returns None if the tag format is invalid despite matching the broad
         _RE_ANY_TAG pattern (e.g. out-of-range numbers).
         """
-        tag_upper = tag.upper().strip()
+        # The opening bracket may be absent (lenient extraction); strip it so
+        # the prefix dispatch below works either way.
+        tag_upper = tag.upper().strip().lstrip("[")
 
-        if tag_upper == "[DONE]" or tag_upper == "DO_NE" or "DONE" in tag_upper:
+        if "DONE" in tag_upper:
             return ParsedAction(action_type=ActionType.DONE)
 
-        if tag_upper.startswith("[CLICK:"):
+        if tag_upper.startswith("CLICK:"):
             return self._decode_click(tag)
 
-        if tag_upper.startswith("[TYPE:"):
+        if tag_upper.startswith("TYPE:"):
             return self._decode_type(tag)
 
-        if tag_upper.startswith("[PRESS:"):
+        if tag_upper.startswith("PRESS:"):
             return self._decode_press(tag)
 
-        if tag_upper.startswith("[SCROLL:"):
+        if tag_upper.startswith("SCROLL:"):
             return self._decode_scroll(tag)
 
         logger.warning("_decode_tag: unrecognised tag prefix: %r", tag)

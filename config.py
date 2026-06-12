@@ -35,14 +35,14 @@ JPEG_QUALITY: int = 85              # Compression quality for API payloads
 # ---------------------------------------------------------------------------
 # Execution loop
 # ---------------------------------------------------------------------------
-MAX_STEPS_PER_COMMAND: int = 12     # Hard limit — prevents runaway loops
+MAX_STEPS_PER_COMMAND: int = 6     # Hard limit — prevents runaway loops
 UI_HIDE_DELAY_MS: int = 250         # ms to wait after hiding UI before first capture
 STEP_DELAY_S: float = 0.5           # Pause between consecutive action steps (seconds)
 
 # ---------------------------------------------------------------------------
 # Input emulation timing (Windows-specific)
 # ---------------------------------------------------------------------------
-CLICK_MOVE_DURATION_S: float = 0.20    # Smooth mouse movement duration
+CLICK_MOVE_DURATION_S: float = 0.30    # Smooth mouse movement duration
 FOCUS_REGISTRATION_DELAY_S: float = 0.15  # Delay after click before typing
 CLIPBOARD_PASTE_DELAY_S: float = 0.10    # Delay after Ctrl+V for Windows paste
 
