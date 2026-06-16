@@ -22,22 +22,38 @@ os.environ["QT_LOGGING_RULES"] = "qt.qpa.window=false"
 # Ensures all coordinate queries return true physical pixels regardless of scaling.
 # ---------------------------------------------------------------------------
 def _init_dpi_awareness() -> None:
+    # IMPORTANT: SetProcessDpiAwarenessContext takes a HANDLE (pointer-width)
+    # argument. Passing a bare Python int marshals as a 32-bit value, which the
+    # API rejects on 64-bit Windows — the call returns 0 (failure) and the
+    # process stays DPI-UNAWARE, so GetSystemMetrics reports *logical* pixels
+    # (e.g. 1536x864 at 125%) while mss captures *physical* pixels (1920x1080).
+    # That mismatch silently corrupts every coordinate conversion. Declaring the
+    # correct argtypes makes the call succeed and metrics return true pixels.
+    from ctypes import wintypes
+
     try:
-        # Force modern Windows 10 Creators Update context layer context first
-        # -4 corresponds to DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
-        ctypes.windll.user32.SetProcessDpiAwarenessContext(-4)
-        return
+        user32 = ctypes.windll.user32
+        user32.SetProcessDpiAwarenessContext.argtypes = [wintypes.HANDLE]
+        user32.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
+        # -4 == DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        if user32.SetProcessDpiAwarenessContext(wintypes.HANDLE(-4)):
+            return
     except Exception:
         pass
 
     try:
         # Fallback to older shcore API if context switching is unavailable
+        # (Windows 8.1 .. 10 pre-1607). 2 == PROCESS_PER_MONITOR_DPI_AWARE.
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
     except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
+        pass
+
+    try:
+        # Last-resort system-DPI awareness (Vista .. Windows 8).
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
 
 _init_dpi_awareness()
@@ -155,7 +171,7 @@ def main() -> None:
     logger.info("Base directory : %s", config.BASE_DIR)
     logger.info("Model          : %s", config.GROK_MODEL)
     logger.info("Max steps      : %d", config.MAX_STEPS_PER_COMMAND)
-    logger.info("Normalized grid: 0-%d", config.NORMALIZED_GRID)
+    logger.info("Max image size : %dpx (longest side)", config.MAX_IMAGE_SIZE)
     logger.info("=" * 60)
 
     _warn_if_not_admin(logger)

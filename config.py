@@ -23,13 +23,15 @@ SYSTEM_PROMPT_PATH = PROMPTS_DIR / "system_prompt.txt"
 # ---------------------------------------------------------------------------
 GROK_API_KEY: str = os.environ.get("AICREDITS_API_KEY", "")
 GROK_API_URL: str = "https://api.aicredits.in/v1/chat/completions"
-GROK_MODEL: str = "openai/gpt-4o-mini"
+GROK_MODEL: str = "openai/gpt-5.4"
 
 # ---------------------------------------------------------------------------
 # Image / coordinate normalisation
 # ---------------------------------------------------------------------------
-MAX_IMAGE_SIZE: int = 1280          # Maximum dimension (px) sent to Grok
-NORMALIZED_GRID: int = 1000         # Grok reasons over a 0-1000 coordinate space
+MAX_IMAGE_SIZE: int = 1920          # Maximum dimension (px) sent to the model.
+                                    # The model reports coordinates in this
+                                    # resized-image pixel space; the coordinator
+                                    # converts them back to physical screen px.
 JPEG_QUALITY: int = 85              # Compression quality for API payloads
 
 # ---------------------------------------------------------------------------

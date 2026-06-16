@@ -144,33 +144,40 @@ def test_screen_capture() -> None:
 # ===========================================================================
 
 def test_coordinate_conversion() -> None:
-    _section("2. Coordinate Conversion")
+    _section("2. Coordinate Conversion (image px → physical px)")
 
-    emu = InputEmulator()
-    grid = config.NORMALIZED_GRID
+    from utils.image_processor import ImageProcessor
 
-    cases: list[tuple[str, int, int]] = [
-        ("origin",      0,      0     ),
-        ("centre",      500,    500   ),
-        ("full-grid",   grid,   grid  ),
-        ("top-right",   grid,   0     ),
-        ("bottom-left", 0,      grid  ),
+    # Simulate a 1920x1080 physical screen captured, then downscaled so its
+    # longest side is 1280 → scale = 1280/1920 = 0.6667 on both axes.
+    scale = 1280 / 1920
+
+    # (label, image_x, image_y, expected_physical_x, expected_physical_y)
+    cases: list[tuple[str, int, int, int, int]] = [
+        ("origin",       0,    0,    0,    0   ),
+        ("centre",       640,  360,  960,  540 ),
+        ("bottom-right", 1280, 720,  1920, 1080),
+        ("top-right",    1280, 0,    1920, 0   ),
+        ("bottom-left",  0,    720,  0,    1080),
     ]
 
-    w = ctypes.windll.user32.GetSystemMetrics(0)
-    h = ctypes.windll.user32.GetSystemMetrics(1)
-
-    for label, nx, ny in cases:
+    for label, ix, iy, exp_x, exp_y in cases:
         try:
-            px, py = emu.normalized_to_physical(nx, ny)
-            expected_x = int(nx * w / grid)
-            expected_y = int(ny * h / grid)
-            assert px == expected_x and py == expected_y, (
-                f"Expected ({expected_x}, {expected_y}), got ({px}, {py})"
+            px, py = ImageProcessor.image_to_physical(ix, iy, scale, scale)
+            assert px == exp_x and py == exp_y, (
+                f"Expected ({exp_x}, {exp_y}), got ({px}, {py})"
             )
-            _pass(f"{label:14s} norm=({nx:4d},{ny:4d})  phys=({px:4d},{py:4d})")
+            _pass(f"{label:14s} img=({ix:4d},{iy:4d})  phys=({px:4d},{py:4d})")
         except Exception as exc:
-            _fail(f"normalized_to_physical({nx}, {ny})", exc)
+            _fail(f"image_to_physical({ix}, {iy})", exc)
+
+    # Identity case: an un-resized image (scale 1.0) maps 1:1.
+    try:
+        px, py = ImageProcessor.image_to_physical(800, 600, 1.0, 1.0)
+        assert (px, py) == (800, 600), f"identity failed: got ({px}, {py})"
+        _pass("identity (scale=1.0) img=( 800, 600)  phys=( 800, 600)")
+    except Exception as exc:
+        _fail("image_to_physical identity", exc)
 
 
 # ===========================================================================
@@ -326,9 +333,9 @@ if __name__ == "__main__":
     logger.info("Python  : %s", sys.version)
     logger.info("Platform: %s", sys.platform)
     logger.info(
-        "Config  : NORMALIZED_GRID=%d  JPEG_QUALITY=%d  "
+        "Config  : MAX_IMAGE_SIZE=%d  JPEG_QUALITY=%d  "
         "CLICK_MOVE_DURATION_S=%.2f",
-        config.NORMALIZED_GRID,
+        config.MAX_IMAGE_SIZE,
         config.JPEG_QUALITY,
         config.CLICK_MOVE_DURATION_S,
     )

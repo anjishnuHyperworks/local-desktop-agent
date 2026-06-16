@@ -129,6 +129,12 @@ class Coordinator(QObject):
         self.current_command: str = ""
         self.use_mock_ai: bool = use_mock_ai
 
+        # Resize scale of the most recently sent screenshot. The model emits
+        # coordinates in resized-image pixels; dividing by these recovers
+        # physical screen pixels. 1.0 means "image not resized / identity".
+        self._last_scale_x: float = 1.0
+        self._last_scale_y: float = 1.0
+
         # -- Mock AI script ---------------------------------------------------
         # Cycled through in order; after exhaustion [DONE] is returned.
         self._mock_responses: list[str] = [
@@ -335,12 +341,18 @@ class Coordinator(QObject):
             _t0 = time.perf_counter()
 
             if action.action_type == ActionType.CLICK:
-                self.status_signal.emit(f"Clicking at ({action.x}, {action.y})")
-                self._input_emulator.click_at(action.x, action.y)
+                px, py = self._image_processor.image_to_physical(
+                    action.x, action.y, self._last_scale_x, self._last_scale_y
+                )
+                self.status_signal.emit(f"Clicking at ({px}, {py})")
+                self._input_emulator.click_at(px, py)
 
             elif action.action_type == ActionType.TYPE:
-                self.status_signal.emit(f"Typing at ({action.x}, {action.y})")
-                self._input_emulator.type_at_coordinates(action.x, action.y, action.text)
+                px, py = self._image_processor.image_to_physical(
+                    action.x, action.y, self._last_scale_x, self._last_scale_y
+                )
+                self.status_signal.emit(f"Typing at ({px}, {py})")
+                self._input_emulator.type_at_coordinates(px, py, action.text)
 
             elif action.action_type == ActionType.PRESS:
                 self.status_signal.emit(f"Pressing key: {action.key}")
@@ -635,6 +647,11 @@ class Coordinator(QObject):
             processed = self._image_processor.resize_for_grok(raw_jpeg)
             b64_image = base64.b64encode(processed.image_bytes).decode("utf-8")
             _perf.info("[latency] image_resize_encode=%.3fs", time.perf_counter() - _t0)
+
+            # Remember the resize scale so execute_action can map the model's
+            # image-pixel coordinates back to physical screen pixels.
+            self._last_scale_x = processed.scale_x
+            self._last_scale_y = processed.scale_y
 
             logger.info(
                 "_call_grok_api: image captured — original=%dx%d, "

@@ -6,7 +6,7 @@ Vision returns.  The convention is that each response contains at most ONE
 action tag at its very end (or no tag if the model appended [DONE]).
 
 Supported tags:
-    [CLICK:x,y]                  — click at normalised coordinates
+    [CLICK:x,y]                  — click at resized-image pixel coordinates
     [TYPE:x,y|text_to_type]      — focus field at (x, y) then paste text
     [PRESS:key_name]             — press a named key (enter, tab, esc, …)
     [SCROLL:direction:amount]    — scroll the wheel (down:3, up:300, …)
@@ -265,9 +265,9 @@ class ActionParser:
         except ValueError:
             logger.warning("Non-integer coordinates in CLICK tag: %r", tag)
             return None
-        if not (self._in_grid(x) and self._in_grid(y)):
+        if not (self._in_pixel_range(x) and self._in_pixel_range(y)):
             logger.warning(
-                "CLICK coordinates out of 0-1000 range: (%d, %d)", x, y
+                "CLICK coordinates out of pixel range: (%d, %d)", x, y
             )
             return None
         return ParsedAction(action_type=ActionType.CLICK, x=x, y=y)
@@ -282,9 +282,9 @@ class ActionParser:
         except ValueError:
             logger.warning("Non-integer coordinates in TYPE tag: %r", tag)
             return None
-        if not (self._in_grid(x) and self._in_grid(y)):
+        if not (self._in_pixel_range(x) and self._in_pixel_range(y)):
             logger.warning(
-                "TYPE coordinates out of 0-1000 range: (%d, %d)", x, y
+                "TYPE coordinates out of pixel range: (%d, %d)", x, y
             )
             return None
         text = m.group(3)   # may be empty string; that is valid
@@ -323,5 +323,13 @@ class ActionParser:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _in_grid(value: int, lo: int = 0, hi: int = 1000) -> bool:
+    def _in_pixel_range(value: int, lo: int = 0, hi: int = 10000) -> bool:
+        """Sanity bound for image-pixel coordinates.
+
+        The model emits pixels in the resized-image space (longest side capped
+        at MAX_IMAGE_SIZE). The parser does not know the exact image dimensions,
+        so this is a loose ceiling that rejects only clearly garbage values
+        (negatives, or absurd numbers from a malformed tag). The InputEmulator
+        clamps the converted physical coordinate to the real screen bounds.
+        """
         return lo <= value <= hi

@@ -2,7 +2,8 @@
 Phase 4: Image Processor
 
 Resizes raw screenshot bytes for API transmission and provides the coordinate
-normalisation helper that maps Grok's 0-1000 grid onto physical display pixels.
+helper that maps the model's resized-image pixel coordinates back onto physical
+display pixels (by undoing the resize scale).
 
 Design decisions:
 - Never upscale: if the image is already small, return it as-is.
@@ -79,7 +80,7 @@ class ImageProcessor:
         """
         Args:
             max_dimension: Longest allowed side in pixels after resizing.
-                           Defaults to config.MAX_IMAGE_SIZE (1280).
+                           Defaults to config.MAX_IMAGE_SIZE.
         """
         self._max_dimension = max_dimension
         logger.debug(
@@ -163,43 +164,47 @@ class ImageProcessor:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def normalize_to_physical(
-        grok_x: int,
-        grok_y: int,
-        screen_width: int,
-        screen_height: int,
-        grid: int = config.NORMALIZED_GRID,
+    def image_to_physical(
+        image_x: int,
+        image_y: int,
+        scale_x: float,
+        scale_y: float,
     ) -> tuple[int, int]:
         """
-        Convert a point in Grok's normalised 0-{grid} coordinate space to
-        physical screen pixels.
+        Convert a point expressed in *resized image* pixels back to physical
+        screen pixels by undoing the resize.
 
-        Formula:
-            physical_x = (grok_x / grid) * screen_width
-            physical_y = (grok_y / grid) * screen_height
+        The model reasons over the resized image it was sent, so its coordinates
+        live in that image's pixel space. Dividing by the resize scale recovers
+        the original (physical, because the process is DPI aware) screen pixel.
+
+            physical_x = image_x / scale_x      where scale_x = resized_w / original_w
+            physical_y = image_y / scale_y
+
+        When the screenshot was not resized, scale_x == scale_y == 1.0 and this
+        is the identity mapping.
 
         Args:
-            grok_x:       X coordinate on the 0-{grid} normalised grid.
-            grok_y:       Y coordinate on the 0-{grid} normalised grid.
-            screen_width: Physical display width in pixels.
-            screen_height: Physical display height in pixels.
-            grid:         Size of the normalised grid (default: NORMALIZED_GRID).
+            image_x: X in resized-image pixels (0 .. resized_width).
+            image_y: Y in resized-image pixels (0 .. resized_height).
+            scale_x: ProcessedImage.scale_x (resized_width / original_width).
+            scale_y: ProcessedImage.scale_y (resized_height / original_height).
 
         Returns:
-            (physical_x, physical_y) clamped to the display bounds.
+            (physical_x, physical_y), un-clamped. The caller (InputEmulator)
+            clamps to the live display bounds.
         """
-        physical_x = int((grok_x / grid) * screen_width)
-        physical_y = int((grok_y / grid) * screen_height)
+        if scale_x <= 0:
+            scale_x = 1.0
+        if scale_y <= 0:
+            scale_y = 1.0
 
-        # Clamp to valid screen area.
-        physical_x = max(0, min(physical_x, screen_width - 1))
-        physical_y = max(0, min(physical_y, screen_height - 1))
+        physical_x = int(image_x / scale_x)
+        physical_y = int(image_y / scale_y)
 
         logger.debug(
-            "normalize_to_physical: grok=(%d,%d) → physical=(%d,%d) "
-            "[screen=%dx%d, grid=%d]",
-            grok_x, grok_y, physical_x, physical_y,
-            screen_width, screen_height, grid,
+            "image_to_physical: image=(%d,%d) scale=(%.4f,%.4f) → physical=(%d,%d)",
+            image_x, image_y, scale_x, scale_y, physical_x, physical_y,
         )
         return physical_x, physical_y
 

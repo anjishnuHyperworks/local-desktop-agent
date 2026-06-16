@@ -53,45 +53,40 @@ class InputEmulator:
     DPI-aware physical-pixel coordinates throughout.
 
     Coordinate space:
-        Grok reasons over a 0–{NORMALIZED_GRID} grid (default 0–1000).
-        normalized_to_physical() maps that grid to the physical display
-        dimensions obtained from Win32, so the translation is correct even
-        on high-DPI / scaled displays.
+        The model emits pixel coordinates in the *resized image* space; the
+        Coordinator converts those to physical display pixels (undoing the
+        resize) before calling this emulator. Every public method here takes
+        physical pixels directly — no grid, no implicit scaling. Because the
+        process is Per-Monitor-v2 DPI aware (set in main.py), physical pixels
+        from Win32 match what mss captures and what SetCursorPos consumes.
     """
 
     def __init__(self) -> None:
         self._mouse = pynput_mouse.Controller()
         self._keyboard = pynput_keyboard.Controller()
 
-        # Cache physical screen size at construction time.
+        # Cache physical screen size at construction time. With DPI awareness
+        # set, these are true physical pixels (e.g. 1920x1080, not 1536x864).
         self._screen_width: int = _user32.GetSystemMetrics(0)
         self._screen_height: int = _user32.GetSystemMetrics(1)
 
         logger.info(
-            "InputEmulator ready — physical display: %dx%d, grid: 0-%d",
+            "InputEmulator ready — physical display: %dx%d",
             self._screen_width,
             self._screen_height,
-            config.NORMALIZED_GRID,
         )
 
     # ------------------------------------------------------------------
-    # Coordinate conversion
+    # Bounds
     # ------------------------------------------------------------------
 
-    def normalized_to_physical(self, x: int, y: int) -> tuple[int, int]:
-        """
-        Map a point in Grok's normalised 0-{NORMALIZED_GRID} grid to physical
-        screen pixels.
-
-            physical_x = x * screen_width  / NORMALIZED_GRID
-            physical_y = y * screen_height / NORMALIZED_GRID
-        """
-        px = int(x * self._screen_width  / config.NORMALIZED_GRID)
-        py = int(y * self._screen_height / config.NORMALIZED_GRID)
-        logger.debug(
-            "Coordinate conversion: (%d, %d) → (%d, %d)", x, y, px, py
-        )
-        return px, py
+    def clamp_to_screen(self, px: int, py: int) -> tuple[int, int]:
+        """Clamp a physical-pixel point to the valid display area."""
+        cx = max(0, min(px, self._screen_width - 1))
+        cy = max(0, min(py, self._screen_height - 1))
+        if (cx, cy) != (px, py):
+            logger.debug("clamp_to_screen: (%d, %d) → (%d, %d)", px, py, cx, cy)
+        return cx, cy
 
     # ------------------------------------------------------------------
     # Mouse movement
@@ -127,13 +122,13 @@ class InputEmulator:
             _user32.SetCursorPos(cx, cy)
             time.sleep(step_delay)
 
-    def click_at(self, x: int, y: int) -> None:
+    def click_at(self, physical_x: int, physical_y: int) -> None:
         """
-        Accept normalised coordinates, convert to physical pixels, smoothly
-        move there, then execute a left click.
+        Accept physical-pixel coordinates, clamp to the screen, smoothly move
+        there, then execute a left click.
         """
-        px, py = self.normalized_to_physical(x, y)
-        logger.info("click_at: normalised (%d, %d) → physical (%d, %d)", x, y, px, py)
+        px, py = self.clamp_to_screen(physical_x, physical_y)
+        logger.info("click_at: physical (%d, %d)", px, py)
         self.move_to(px, py)
         self._mouse.click(pynput_mouse.Button.left)
 
@@ -172,16 +167,18 @@ class InputEmulator:
                 self._keyboard.release("v")
             time.sleep(config.CLIPBOARD_PASTE_DELAY_S)
 
-    def type_at_coordinates(self, x: int, y: int, text: str) -> None:
+    def type_at_coordinates(self, physical_x: int, physical_y: int, text: str) -> None:
         """
-        Click to focus, wait for Windows to register the focus event, then
-        paste text.  The focus delay is mandatory — omitting it causes Windows
-        to drop the first few characters of the paste on slower machines.
+        Click to focus (physical-pixel coordinates), wait for Windows to register
+        the focus event, then paste text.  The focus delay is mandatory — omitting
+        it causes Windows to drop the first few characters of the paste on slower
+        machines.
         """
         logger.info(
-            "type_at_coordinates: (%d, %d), text length=%d", x, y, len(text)
+            "type_at_coordinates: (%d, %d), text length=%d",
+            physical_x, physical_y, len(text),
         )
-        self.click_at(x, y)
+        self.click_at(physical_x, physical_y)
         time.sleep(config.FOCUS_REGISTRATION_DELAY_S)
         self.type_string(text)
 
@@ -262,8 +259,8 @@ class InputEmulator:
         ]
 
         logger.info(
-            "DPI test — physical screen: %dx%d, grid: 0-%d",
-            w, h, config.NORMALIZED_GRID,
+            "DPI test — physical screen: %dx%d",
+            w, h,
         )
 
         for name, tx, ty in landmarks:
