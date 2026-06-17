@@ -23,7 +23,7 @@ SYSTEM_PROMPT_PATH = PROMPTS_DIR / "system_prompt.txt"
 # ---------------------------------------------------------------------------
 GROK_API_KEY: str = os.environ.get("AICREDITS_API_KEY", "")
 GROK_API_URL: str = "https://api.aicredits.in/v1/chat/completions"
-GROK_MODEL: str = "openai/gpt-5.4"
+GROK_MODEL: str = "anthropic/claude-sonnet-4.5"
 
 # ---------------------------------------------------------------------------
 # Image / coordinate normalisation
@@ -37,15 +37,35 @@ JPEG_QUALITY: int = 85              # Compression quality for API payloads
 # ---------------------------------------------------------------------------
 # Execution loop
 # ---------------------------------------------------------------------------
-MAX_STEPS_PER_COMMAND: int = 15    # Soft working budget — protects latency, responsiveness, API cost
+# MAX_STEPS_PER_COMMAND is a fallback floor used only when there is no plan.
+# The real per-command step budget is derived from the plan size at runtime
+# (see _compute_step_budget): BASE_STEPS + STEPS_PER_TASK * num_tasks, capped
+# by MAX_ACTIONS. This keeps the step budget genuinely "soft" (it scales with
+# how ambitious the plan is) while MAX_ACTIONS remains the fixed runaway guard.
+MAX_STEPS_PER_COMMAND: int = 15    # Fallback step budget when no plan exists
+BASE_STEPS: int = 6                 # Fixed step headroom granted to every command
+STEPS_PER_TASK: int = 4             # Additional step budget granted per planned task
 MAX_ACTIONS: int = 120              # Absolute runaway-protection ceiling — structural safety
 UI_HIDE_DELAY_MS: int = 250         # ms to wait after hiding UI before first capture
 STEP_DELAY_S: float = 0.5           # Pause between consecutive action steps (seconds)
+
+# WAIT action bounds — a WAIT sleeps then re-observes without consuming a real
+# working step, so the model can sit through a page load in a single tag.
+WAIT_DEFAULT_S: float = 2.0         # Duration when [WAIT] is issued with no argument
+WAIT_MAX_S: float = 10.0            # Clamp ceiling for [WAIT:seconds]
+MAX_CONSECUTIVE_WAITS: int = 4      # Guard: at most this many WAITs in a row
 
 # ---------------------------------------------------------------------------
 # Long-horizon planning / reflection / replanning
 # ---------------------------------------------------------------------------
 MAX_REPLANS: int = 5                       # Hard ceiling on replanning cycles before failing
+
+# Planner HTTP call hardening. The planner runs once per command and produces
+# the task decomposition the executor relies on; a too-tight timeout makes it
+# silently fall back to a single-task plan (no decomposition at all), which
+# starves multi-step goals of step budget. Give it generous time and one retry.
+PLANNER_TIMEOUT_S: float = 45.0            # Per-attempt timeout for the planner API call
+PLANNER_MAX_ATTEMPTS: int = 2              # Total attempts (initial + retries) before fallback
 MAX_STUCK_TIME_S: float = 45.0             # Temporal stagnation: no successful action for this long
 MAX_SEMANTIC_STAGNATION_STEPS: int = 8     # Semantic stagnation: steps without state advancement
 MAX_CONSECUTIVE_FAILURES: int = 5          # Consecutive failed actions before recovery

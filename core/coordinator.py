@@ -189,6 +189,26 @@ class Coordinator(QObject):
         self.current_reflection: Optional[ReflectionResult] = None
         self.replan_count: int = 0
 
+        # -- Last-command memory (drives context-aware intent routing) --------
+        # A follow-up like "why didn't it open?" / "try again" is only
+        # interpretable relative to the command that just ran. We remember the
+        # previous automation command and how it ended so classify_intent can
+        # treat a vague follow-up as a continuation of that task rather than as
+        # context-free trivia.
+        self._last_automation_command: Optional[str] = None
+        self._last_automation_outcome: Optional[str] = None  # "finished" | "error" | "aborted"
+        self._automation_succeeded: bool = False
+        self._aborted_by_user: bool = False
+
+        # Step budget for the current command. Derived from the plan size at
+        # runtime (see _compute_step_budget); defaults to the static fallback
+        # until a plan exists. MAX_ACTIONS is the separate, fixed runaway guard.
+        self._step_budget: int = config.MAX_STEPS_PER_COMMAND
+
+        # Consecutive [WAIT] guard — prevents the model from stalling forever
+        # by waiting on a page that never changes.
+        self._consecutive_waits: int = 0
+
         # Resize scale of the most recently sent screenshot. The model emits
         # coordinates in resized-image pixels; dividing by these recovers
         # physical screen pixels. 1.0 means "image not resized / identity".
@@ -218,7 +238,41 @@ class Coordinator(QObject):
     # Planner
     # ------------------------------------------------------------------
 
-    def create_plan(self, goal: str) -> Plan:
+    def _build_prior_task_context(self) -> Optional[str]:
+        """
+        Summarise the immediately-preceding automation for the planner, so a
+        follow-up command can be planned as a recovery/continuation.
+
+        Returns None when there is no useful prior context — i.e. no automation
+        has run yet, or the last one finished cleanly (a follow-up after success
+        is almost always a fresh task, and stale context would only mislead the
+        planner). Returns a short note for unfinished outcomes (error / aborted /
+        still in_progress) since those are exactly the cases a follow-up tends to
+        be about.
+        """
+        command = self._last_automation_command
+        outcome = self._last_automation_outcome
+        if not command or outcome in (None, "finished"):
+            return None
+
+        outcome_phrase = {
+            "error": "did NOT complete — it failed or got stuck",
+            "aborted": "was stopped by the user before completing",
+            "in_progress": "was still running and did not reach completion",
+        }.get(outcome, f"ended with outcome '{outcome}'")
+
+        return (
+            "Context — the user's previous desktop automation task "
+            f"{outcome_phrase}:\n"
+            f"  previous command: {command}\n"
+            "The new goal below is most likely a FOLLOW-UP about that attempt "
+            "(e.g. a correction, a request to retry, or to fix what went wrong). "
+            "Plan the steps needed to recover and achieve the original intent on "
+            "the CURRENT screen — do not assume a clean starting state, and check "
+            "what is actually visible before acting."
+        )
+
+    def create_plan(self, goal: str, prior_context: Optional[str] = None) -> Plan:
         """
         Decompose the user's objective into a sequential list of tasks.
 
@@ -227,6 +281,11 @@ class Coordinator(QObject):
 
         Args:
             goal: The user's command/objective
+            prior_context: Optional summary of a desktop task that was just
+                attempted (its command and outcome). Supplied when the new goal
+                is a follow-up ("why didn't it open?", "fix the error", "try
+                again") so the planner can plan a recovery/continuation instead
+                of starting from a blank slate.
 
         Returns:
             A Plan with a list of tasks to accomplish the goal
@@ -240,12 +299,23 @@ class Coordinator(QObject):
             ]
             return Plan(goal=goal, tasks=tasks, current_index=0)
 
+        # When this goal is a follow-up to a just-attempted task, give the
+        # planner that context so a vague correction ("fix it", "try again")
+        # becomes a concrete recovery plan rather than an empty/literal one.
+        prior_note = (
+            f"{prior_context}\n\n" if prior_context else ""
+        )
+
         # Real planner calls the AI to decompose the goal
         planner_prompt = (
             "You are a task planner for a desktop automation agent.\n"
             "Decompose the user's goal into a sequential list of specific, actionable tasks.\n"
             "Each task should be a single step that can be accomplished by observing the screen "
-            "and taking one or more actions (click, type, scroll, press).\n\n"
+            "and taking one or more actions (click, type, scroll, press).\n"
+            "Do NOT create standalone tasks for waiting, loading, or confirming that a page "
+            "has appeared — the executor handles waiting on its own. Plan only the actions that "
+            "advance the goal, and keep the list as short as the goal allows.\n\n"
+            f"{prior_note}"
             f"User Goal: {goal}\n\n"
             "Output your response as a numbered list of tasks, one per line. "
             "Be specific but concise. Example:\n"
@@ -254,44 +324,63 @@ class Coordinator(QObject):
             "3. Inspect the spreadsheet\n"
         )
 
-        try:
-            with httpx.Client(timeout=10.0) as client:
-                response = client.post(
-                    config.GROK_API_URL,
-                    json={
-                        "model": config.GROK_MODEL,
-                        "messages": [
-                            {"role": "system", "content": planner_prompt},
-                            {"role": "user", "content": goal},
-                        ],
-                    },
-                    headers={"Authorization": f"Bearer {config.GROK_API_KEY}"},
+        # The planner runs once per command and its decomposition drives the
+        # executor's step budget, so a transient timeout collapsing it to a
+        # single-task fallback is expensive — it starves multi-step goals. Retry
+        # on transient failures before giving up; only fall back when every
+        # attempt fails.
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, config.PLANNER_MAX_ATTEMPTS + 1):
+            try:
+                with httpx.Client(timeout=config.PLANNER_TIMEOUT_S) as client:
+                    response = client.post(
+                        config.GROK_API_URL,
+                        json={
+                            "model": config.GROK_MODEL,
+                            "messages": [
+                                {"role": "system", "content": planner_prompt},
+                                {"role": "user", "content": goal},
+                            ],
+                        },
+                        headers={"Authorization": f"Bearer {config.GROK_API_KEY}"},
+                    )
+                response.raise_for_status()
+                result = response.json()["choices"][0]["message"]["content"].strip()
+
+                # Parse the numbered list into tasks
+                tasks = []
+                for line in result.split('\n'):
+                    line = line.strip()
+                    if line and (line[0].isdigit() or line.startswith('-')):
+                        # Remove the number/bullet and any leading punctuation
+                        task_desc = line.split('.', 1)[-1].split('-', 1)[-1].strip()
+                        if task_desc:
+                            tasks.append(Task(description=task_desc))
+
+                if not tasks:
+                    # Fallback if parsing failed
+                    tasks = [Task(description=goal)]
+
+                logger.info(
+                    "Planner created %d tasks for goal (attempt %d/%d): %s",
+                    len(tasks), attempt, config.PLANNER_MAX_ATTEMPTS, goal,
                 )
-            response.raise_for_status()
-            result = response.json()["choices"][0]["message"]["content"].strip()
+                return Plan(goal=goal, tasks=tasks, current_index=0)
 
-            # Parse the numbered list into tasks
-            tasks = []
-            for line in result.split('\n'):
-                line = line.strip()
-                if line and (line[0].isdigit() or line.startswith('-')):
-                    # Remove the number/bullet and any leading punctuation
-                    task_desc = line.split('.', 1)[-1].split('-', 1)[-1].strip()
-                    if task_desc:
-                        tasks.append(Task(description=task_desc))
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "Planner attempt %d/%d failed: %s",
+                    attempt, config.PLANNER_MAX_ATTEMPTS, exc,
+                )
 
-            if not tasks:
-                # Fallback if parsing failed
-                tasks = [Task(description=goal)]
-
-            logger.info("Planner created %d tasks for goal: %s", len(tasks), goal)
-            return Plan(goal=goal, tasks=tasks, current_index=0)
-
-        except Exception as exc:
-            logger.error("Planner failed, using fallback: %s", exc)
-            # Fallback: single task with the original goal
-            tasks = [Task(description=goal)]
-            return Plan(goal=goal, tasks=tasks, current_index=0)
+        logger.error(
+            "Planner failed after %d attempt(s), using single-task fallback: %s",
+            config.PLANNER_MAX_ATTEMPTS, last_exc,
+        )
+        # Fallback: single task with the original goal
+        tasks = [Task(description=goal)]
+        return Plan(goal=goal, tasks=tasks, current_index=0)
 
     # ------------------------------------------------------------------
     # Reflection
@@ -580,12 +669,24 @@ class Coordinator(QObject):
                 logger.info("Routing to Desktop Automation loop.")
                 self.status_signal.emit(f"Starting automation: {command}")
 
+                # Build follow-up context from the PREVIOUS automation (if any)
+                # before we overwrite the memory below. This lets the planner
+                # turn a vague correction into a concrete recovery plan.
+                prior_context = self._build_prior_task_context()
+
                 # Create plan at the beginning of automation
                 _t0 = time.perf_counter()
-                self.current_plan = self.create_plan(command)
+                self.current_plan = self.create_plan(command, prior_context=prior_context)
                 if self.current_plan.tasks:
                     self.current_plan.tasks[0].status = TaskStatus.IN_PROGRESS
+                self._step_budget = self._compute_step_budget()
                 _perf.info("[latency] planning=%.3fs", time.perf_counter() - _t0)
+
+                # Remember this as the most recent automation so a follow-up
+                # ("why didn't it work?", "try again") routes back to AUTOMATION.
+                # The outcome is filled in when run_loop terminates.
+                self._last_automation_command = command
+                self._last_automation_outcome = "in_progress"
 
                 # run_loop() manages is_running internally
                 self.run_loop()
@@ -597,7 +698,18 @@ class Coordinator(QObject):
         # No finally: CHAT releases via handle_pure_chat(), AUTOMATION via run_loop()
 
     def classify_intent(self, command: str) -> str:
-        """Determines if the command requires desktop automation or is purely text-based."""
+        """
+        Determine whether the command requires desktop automation or is a pure
+        chat/knowledge question.
+
+        Context-aware: if a desktop automation command just ran (and especially
+        if it stalled or errored), a vague follow-up such as "why didn't it
+        open?", "that didn't work", "try again", or "fix the error" is a
+        continuation of that task — it must route to AUTOMATION, not be answered
+        as standalone trivia. We pass the previous command and its outcome to the
+        router so it can resolve those references instead of seeing a
+        context-free question.
+        """
         if self.use_mock_ai:
             return "AUTOMATION"
 
@@ -606,8 +718,23 @@ class Coordinator(QObject):
             "Analyze the user's input and classify it into one of two categories:\n"
             "1. AUTOMATION: If the user is asking to control the computer (click, type, scroll, open an app), OR asking about what is currently on their screen (e.g. 'what's on the screen?', 'what do you see?', 'read the screen', 'what's open?', 'describe the screen').\n"
             "2. CHAT: If the user is asking a general knowledge question, greeting you, asking for calculations, or having a casual conversation that has nothing to do with their current screen or computer state.\n\n"
+            "IMPORTANT — follow-up rule: If a desktop automation task was just attempted, a follow-up that refers to it implicitly is a CONTINUATION and must be AUTOMATION. This includes messages like 'why didn't it work?', 'that didn't open', 'try again', 'fix the error', 'it failed', 'do it now', 'continue', or any complaint/correction about the previous attempt. Only classify such a follow-up as CHAT if it is CLEARLY unrelated general knowledge.\n\n"
             "Output EXACTLY 'AUTOMATION' or 'CHAT'. Do not include any other text."
         )
+
+        # Build the prior-task context, if any. An automation that ended in
+        # error/abort makes a follow-up far more likely to be a continuation.
+        if self._last_automation_command:
+            outcome = self._last_automation_outcome or "unknown"
+            context_note = (
+                "Context — a desktop automation task was just attempted:\n"
+                f"  previous command: {self._last_automation_command}\n"
+                f"  outcome: {outcome}\n\n"
+                "Now classify the user's NEW input below, applying the follow-up rule.\n\n"
+                f"User input: {command}"
+            )
+        else:
+            context_note = command
 
         try:
             with httpx.Client(timeout=5.0) as client:
@@ -617,7 +744,7 @@ class Coordinator(QObject):
                         "model": config.GROK_MODEL,
                         "messages": [
                             {"role": "system", "content": classification_prompt},
-                            {"role": "user", "content": command},
+                            {"role": "user", "content": context_note},
                         ],
                     },
                     headers={"Authorization": f"Bearer {config.GROK_API_KEY}"},
@@ -708,6 +835,7 @@ class Coordinator(QObject):
             - Modify any other coordinator state
         """
         logger.info("stop_command called — setting is_running=False")
+        self._aborted_by_user = True
         self.is_running = False
 
     # ------------------------------------------------------------------
@@ -745,6 +873,16 @@ class Coordinator(QObject):
                 self.status_signal.emit(f"Scrolling {action.direction} by {action.amount}")
                 self._input_emulator.scroll(action.direction, action.amount)
 
+            elif action.action_type == ActionType.WAIT:
+                secs = action.seconds if action.seconds is not None else config.WAIT_DEFAULT_S
+                secs = max(0.0, min(secs, config.WAIT_MAX_S))
+                self.status_signal.emit(f"Waiting {secs:g}s for the screen to settle...")
+                time.sleep(secs)
+
+            elif action.action_type == ActionType.NEW_TAB:
+                self.status_signal.emit("Opening a new browser tab...")
+                self._input_emulator.open_new_browser_tab()
+
             _perf.info("[latency] action_execution(%s)=%.3fs", action.action_type.name, time.perf_counter() - _t0)
             return "success"
 
@@ -779,6 +917,30 @@ class Coordinator(QObject):
 
         return False
 
+    def _compute_step_budget(self) -> int:
+        """
+        Derive the soft step budget for the current command from the plan size.
+
+        Each planned task needs at least one step, plus retries, waits and the
+        occasional confirmation step — so a flat ceiling that ignores task count
+        (the old behaviour) kills multi-task plans before they can finish. We
+        grant BASE_STEPS of fixed headroom plus STEPS_PER_TASK per task, capped
+        by MAX_ACTIONS so the absolute runaway guard is never exceeded.
+
+        Falls back to MAX_STEPS_PER_COMMAND when there is no plan.
+        """
+        if not self.current_plan or not self.current_plan.tasks:
+            return config.MAX_STEPS_PER_COMMAND
+
+        num_tasks = len(self.current_plan.tasks)
+        budget = config.BASE_STEPS + config.STEPS_PER_TASK * num_tasks
+        budget = min(budget, config.MAX_ACTIONS)
+        logger.info(
+            "_compute_step_budget: %d tasks → step budget %d (cap %d)",
+            num_tasks, budget, config.MAX_ACTIONS,
+        )
+        return budget
+
     # ------------------------------------------------------------------
     # Main execution loop (runs entirely in the worker thread)
     # ------------------------------------------------------------------
@@ -802,9 +964,9 @@ class Coordinator(QObject):
 
         _loop_start = time.perf_counter()
         logger.info(
-            "run_loop started — command=%r, max_steps=%d, max_actions=%d, mock=%s",
+            "run_loop started — command=%r, step_budget=%d, max_actions=%d, mock=%s",
             self.current_command,
-            config.MAX_STEPS_PER_COMMAND,
+            self._step_budget,
             config.MAX_ACTIONS,
             self.use_mock_ai,
         )
@@ -813,12 +975,19 @@ class Coordinator(QObject):
         self._last_success_time = time.perf_counter()
         self._consecutive_failures = 0
         self._steps_without_progress = 0
+        self._consecutive_waits = 0
         self._retry_attempted = False   # escalation stage: LOCAL_RETRY → REFLECTING
+
+        # Outcome marker for last-command memory. _handle_step_outcome flips this
+        # to True on genuine completion; any other exit (budget, abort, error,
+        # exception) leaves it False and is resolved in the finally below.
+        self._automation_succeeded = False
+        self._aborted_by_user = False
 
         try:
             while (
                 self.is_running
-                and self.current_step < config.MAX_STEPS_PER_COMMAND
+                and self.current_step < self._step_budget
                 and self.total_actions < config.MAX_ACTIONS
             ):
                 self.current_step += 1
@@ -826,7 +995,7 @@ class Coordinator(QObject):
                 logger.info(
                     "Loop iteration %d/%d (total actions: %d/%d, mode: %s)",
                     self.current_step,
-                    config.MAX_STEPS_PER_COMMAND,
+                    self._step_budget,
                     self.total_actions,
                     config.MAX_ACTIONS,
                     self.current_mode.value,
@@ -839,7 +1008,7 @@ class Coordinator(QObject):
                 else:
                     task_info = "Executing..."
                 self.status_signal.emit(
-                    f"Step {self.current_step}/{config.MAX_STEPS_PER_COMMAND} — {task_info}"
+                    f"Step {self.current_step}/{self._step_budget} — {task_info}"
                 )
 
                 # Execute one reasoning + action cycle based on current mode
@@ -868,6 +1037,11 @@ class Coordinator(QObject):
                         return
                     self.status_signal.emit("Replanning based on reflection...")
                     self.current_plan = self.replan(self.current_reflection)
+                    # A replan may add tasks; extend the budget to fit them
+                    # (never shrink — steps already spent must still count).
+                    self._step_budget = max(
+                        self._step_budget, self._compute_step_budget()
+                    )
                     # Transition back to NORMAL with a clean recovery slate so the
                     # next stall (if any) re-escalates from LOCAL_RETRY.
                     self.current_mode = AgentMode.NORMAL
@@ -925,10 +1099,10 @@ class Coordinator(QObject):
                 return
 
             # Loop exited because step limit was reached.
-            if self.current_step >= config.MAX_STEPS_PER_COMMAND:
+            if self.current_step >= self._step_budget:
                 logger.warning(
-                    "run_loop: max steps (%d) exceeded — aborting",
-                    config.MAX_STEPS_PER_COMMAND,
+                    "run_loop: step budget (%d) exceeded — aborting",
+                    self._step_budget,
                 )
                 self.is_running = False
                 self.error_signal.emit(
@@ -948,6 +1122,21 @@ class Coordinator(QObject):
             logger.exception("run_loop: fatal unhandled exception: %s", exc)
             self.is_running = False
             self.error_signal.emit(f"Fatal error encountered: {exc}")
+
+        finally:
+            # Resolve last-command memory exactly once, regardless of which exit
+            # path the loop took. A vague follow-up after a non-"finished"
+            # outcome ("why didn't it work?") will then route back to AUTOMATION.
+            if self._automation_succeeded:
+                self._last_automation_outcome = "finished"
+            elif self._aborted_by_user:
+                self._last_automation_outcome = "aborted"
+            else:
+                self._last_automation_outcome = "error"
+            logger.info(
+                "run_loop: outcome recorded for follow-up routing → %s",
+                self._last_automation_outcome,
+            )
 
     def _handle_step_outcome(
         self, outcome: Optional[ActionType], loop_start: float
@@ -989,6 +1178,7 @@ class Coordinator(QObject):
                 self.current_step,
             )
             self.is_running = False
+            self._automation_succeeded = True
             self.finished_signal.emit("Task completed successfully.")
             return True
 
@@ -1003,6 +1193,7 @@ class Coordinator(QObject):
                     self.current_step,
                 )
                 self.is_running = False
+                self._automation_succeeded = True
                 self.finished_signal.emit("Task completed successfully.")
                 return True
 
@@ -1065,8 +1256,10 @@ class Coordinator(QObject):
         action_tag_str = str(action) if action else None
         if action is None:
             execution_result = "skipped"
+            self._consecutive_waits = 0
         elif action.action_type in (ActionType.DONE, ActionType.TASK_COMPLETE):
             execution_result = "success"
+            self._consecutive_waits = 0
             # A control tag is genuine progress — reset stagnation counters so a
             # multi-task goal isn't flagged stuck just because individual tasks
             # complete without a coordinate action on that step.
@@ -1074,8 +1267,25 @@ class Coordinator(QObject):
             self._consecutive_failures = 0
             self._steps_without_progress = 0
             self._retry_attempted = False
+        elif action.action_type == ActionType.WAIT:
+            # WAIT just sleeps and re-observes (e.g. while a page loads). It is
+            # not real work, so refund the step it would otherwise consume —
+            # unless the model has been waiting repeatedly, in which case we let
+            # it count toward the budget so a stuck page can't loop forever.
+            self._consecutive_waits += 1
+            execution_result = self.execute_action(action)
+            if self._consecutive_waits <= config.MAX_CONSECUTIVE_WAITS:
+                self.current_step -= 1
+                self.total_actions -= 1
+            else:
+                logger.warning(
+                    "process_single_step: %d consecutive WAITs — no longer "
+                    "refunding the step budget",
+                    self._consecutive_waits,
+                )
         else:
             execution_result = self.execute_action(action)
+            self._consecutive_waits = 0
             # Reset stagnation counters on successful action execution
             if execution_result == "success":
                 self._last_success_time = time.perf_counter()
@@ -1113,17 +1323,31 @@ class Coordinator(QObject):
 
     def build_history_context(self) -> str:
         """
-        Fetch recent interactions from the DB and format them as a compact,
-        text-only summary suitable for injection into an AI prompt.
+        Fetch recent interactions from the DB and format them as an explicit,
+        text-only world-state summary suitable for injection into an AI prompt.
+
+        Rather than flat "User/Assistant/Action" prose (which forces the model to
+        re-derive what it tried and whether it worked on every step), this emits a
+        numbered step log carrying each step's reasoning, the exact action tag,
+        and its execution result — plus a "Current state" block summarising the
+        most recent attempt and how many times the identical action has been
+        repeated. That gives the model the last_action / result / attempt_count
+        framing it needs to notice a stuck approach and change tack.
 
         Format example:
-            User: Open Chrome
-            Assistant: Clicking Chrome icon
-            Action: CLICK
+            Recent steps (oldest first):
+              1. action=[CLICK:1022,970] result=success
+                 reasoning: Clicking the Chrome taskbar icon.
+              2. action=[CLICK:965,970] result=success
+                 reasoning: Trying the taskbar Search box instead.
 
-            User: Search weather
-            Assistant: Typing search query
-            Action: TYPE
+            Current state:
+              last_action: [CLICK:965,970]
+              last_result: success
+              repeated_action_count: 2 (this same action has been issued 2 step(s) in a row)
+              note: The last action executed but the goal is not yet confirmed
+                    complete — verify on the screenshot whether it had the
+                    intended effect before repeating it.
 
         Constraints:
             - No screenshots, no image bytes, no Base64 strings.
@@ -1135,27 +1359,70 @@ class Coordinator(QObject):
             logger.error("build_history_context: DB read failed: %s", exc)
             return ""
 
-        if not records:
-            logger.debug("build_history_context: no history available")
+        # Keep only records that represent an actual agent step (they carry an
+        # action tag). The very first row of a command also holds the user
+        # command with no action tag; surface that as the goal line.
+        step_records = [r for r in records if r.action_tag]
+        if not step_records:
+            logger.debug("build_history_context: no step history available")
             return ""
 
-        lines: list[str] = []
-        for record in records:
-            if record.user_command:
-                lines.append(f"User: {record.user_command}")
+        lines: list[str] = ["Recent steps (oldest first):"]
+        for i, record in enumerate(step_records, start=1):
+            result = record.execution_result or "unknown"
+            lines.append(f"  {i}. action={record.action_tag} result={result}")
             if record.assistant_response:
-                lines.append(f"Assistant: {record.assistant_response}")
-            if record.action_tag:
-                # Extract bare action type name for compactness.
-                action_type = record.action_tag.lstrip("[").split(":")[0]
-                lines.append(f"Action: {action_type}")
-            if lines and lines[-1] != "":
-                lines.append("")    # blank separator between turns
+                # Collapse the model's reasoning to a single compact line.
+                reasoning = " ".join(record.assistant_response.split())
+                if len(reasoning) > 200:
+                    reasoning = reasoning[:197] + "..."
+                lines.append(f"     reasoning: {reasoning}")
+
+        # -- Explicit current-state block ------------------------------------
+        last = step_records[-1]
+        last_result = last.execution_result or "unknown"
+
+        # How many times the identical action tag has been issued at the tail —
+        # a high count is the signal that the current approach is stuck.
+        repeated = 0
+        for record in reversed(step_records):
+            if record.action_tag == last.action_tag:
+                repeated += 1
+            else:
+                break
+
+        lines.append("")
+        lines.append("Current state:")
+        lines.append(f"  last_action: {last.action_tag}")
+        lines.append(f"  last_result: {last_result}")
+        lines.append(
+            f"  repeated_action_count: {repeated} "
+            f"(this same action has been issued {repeated} step(s) in a row)"
+        )
+        if last_result == "error":
+            lines.append(
+                "  note: The last action failed to execute. Do not repeat it "
+                "verbatim — pick a different target or approach."
+            )
+        elif repeated >= 2:
+            lines.append(
+                "  note: You have issued the SAME action repeatedly without "
+                "confirmed progress. The previous attempts likely did not have "
+                "the intended effect (e.g. the click missed its target or focus "
+                "went elsewhere). Change approach — re-check the element's "
+                "coordinates on the screenshot or try a different element."
+            )
+        else:
+            lines.append(
+                "  note: The last action executed, but success is not confirmed. "
+                "Verify on the screenshot whether it had the intended effect "
+                "before continuing."
+            )
 
         context = "\n".join(lines).strip()
         logger.debug(
-            "build_history_context: %d records → %d chars",
-            len(records), len(context),
+            "build_history_context: %d step record(s) → %d chars",
+            len(step_records), len(context),
         )
         return context
 

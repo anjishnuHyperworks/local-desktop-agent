@@ -202,6 +202,19 @@ class InputEmulator:
         self._keyboard.press(key)
         self._keyboard.release(key)
 
+    def open_new_browser_tab(self) -> None:
+        """
+        Open a fresh tab in the focused browser via Ctrl+T.
+
+        Used when a task needs a clean browser tab but the current tab already
+        holds the user's content, so navigating in place would clobber it.
+        """
+        logger.info("open_new_browser_tab: sending Ctrl+T")
+        with self._keyboard.pressed(Key.ctrl):
+            self._keyboard.press("t")
+            self._keyboard.release("t")
+        time.sleep(config.FOCUS_REGISTRATION_DELAY_S)
+
     # ------------------------------------------------------------------
     # Scrolling
     # ------------------------------------------------------------------
