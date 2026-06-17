@@ -1,193 +1,222 @@
 # Project Implementation Plan: Local Desktop Automation Agent
 
 ## Overview
-This document provides a **step-by-step iterative plan** for an LLM (like Grok, Claude, or Cursor) to build the full local desktop automation agent described in `hld_local_desktop_agent.md`.
+This document provides the definitive, **phase-by-phase implementation plan** for an LLM (like Grok, Claude, or Cursor) to build the production-grade local desktop automation agent described in `hld_local_desktop_agent.md`.
 
-The development follows a modular, bottom-up + integration approach to minimize bugs and allow early testing.
+It synthesizes the original modular layout with structural reliability enhancements: a formal **finite-state machine** (`AgentMode`), an **independent vitality watchdog**, **deterministic failure fingerprinting**, **frequency-based oscillation detection**, an **API circuit breaker**, and a **versioned, append-only EventStore** with crash recovery.
+
+The development follows a safety-first, bottom-up + integration approach to minimize bugs and allow early testing.
 
 **Goal**: Create a working Python application that:
 - Activates via `Ctrl+Space`
-- Shows a floating Spotlight-style input
+- Shows a floating Spotlight-style input plus a non-intrusive Status HUD
 - Captures screen (primary monitor)
-- Sends to Grok Vision API with history context
+- Sends to Grok Vision API with text-only history context
 - Parses actions like `[CLICK:x,y]`, `[TYPE:x,y|text]`, `[PRESS:key_name]`, `[SCROLL:direction:amount]`
-- Executes mouse/keyboard actions in a **continuous loop** until `[DONE]`
+- Executes mouse/keyboard actions in a **supervised continuous loop** until `[DONE]` or a structural budget / safety trip terminates it
+
+> **Important Coordinate Resolution Note:** To maintain absolute alignment with the visual processing behavior of modern vision models and resolve underlying configuration contradictions, the entire system uses **absolute scaled-image pixel positions** (top-left = `0,0`), which are mapped back onto physical display coordinates by the `ImageProcessor` layer.
 
 ---
 
-## Prerequisites
+## Prerequisites & Configuration
 
-1. **Environment Setup**
-   - Python 3.10+
-   - Create a virtual environment: `python -m venv venv`
-   - Install core dependencies (will be expanded per phase):
-     ```bash
-     pip install pyqt6 pynput mss pillow pyautogui httpx pyperclip
-     ```
+### 1. Environment & Administrative Privileges
+- Python 3.10+ virtual environment: `python -m venv venv`
+- Install core dependencies (expanded per phase):
+  ```bash
+  pip install pyqt6 pynput mss pillow pyautogui httpx pyperclip
+  ```
+- The local terminal/runner **must be executed as Administrator** to enable Windows UAC input injection safety.
 
-2. **API Key**
-   - Obtain xAI Grok API key and store it securely (e.g., via environment variable `GROK_API_KEY`).
+### 2. API Key
+- Obtain the xAI Grok API key and store it securely (e.g., environment variable `GROK_API_KEY`).
 
-3. **Windows-Specific**
-   - Run the script/terminal **as Administrator** for UAC compatibility.
-   - Document DPI awareness and physical coordinate handling.
+### 3. Required Configurations (`config.py`)
+Define these exact production thresholds:
+```python
+# Hard Loop Budgets
+MAX_ACTIONS = 120
+MAX_REPLANS = 5
+MAX_RUNTIME_MINUTES = 30
+ACTION_TIMEOUT = 12
+MAX_CONSECUTIVE_FAILURES = 5
 
-4. **Project Structure** (to be created in Phase 1)
+# Stagnation & Oscillation Failsafes
+MAX_STUCK_TIME = 45                  # Max seconds without forward progress
+MAX_SEMANTIC_STAGNATION_STEPS = 8    # Max loop steps without state advancement
+MAX_OSCILLATION_COUNT = 2            # Max times a distinct failure hash can repeat
+
+# Escalation Control
+LOCAL_RETRY_THRESHOLD = 2
+REFLECTION_COOLDOWN = 25
+MIN_REPLAN_INTERVAL = 35
+
+# Advanced Safety Timing & Sizing
+CIRCUIT_BREAKER_FAILURE_THRESHOLD = 3
+CIRCUIT_BREAKER_TIMEOUT = 120        # Cooldown duration in seconds
+WATCHDOG_TIMEOUT = 60                # Hard timeout for loop heartbeat
+MAX_EVENTSTORE_ENTRIES = 500
+MAX_SCREENSHOT_HISTORY = 20
+STATE_SCHEMA_VERSION = 1
+```
+Plus existing UI/image constants (e.g., `MAX_IMAGE_SIZE=1280`, `UI_HIDE_DELAY_MS=250`).
 
 ---
 
-## Phase 1: Project Setup & Structure
+## Phase 1: Core Architecture & Safety Primitives
 
-**Objective**: Set up the repository skeleton and basic configuration.
+**Objective**: Establish the hardened configuration, process environment context, and standalone safety utility layers.
 
 **Steps for LLM**:
-1. Create the directory structure as previously defined.
-2. Generate `requirements.txt` with all necessary packages.
-3. Create `config.py` for API keys, constants (e.g., `MAX_IMAGE_SIZE=1280`, `UI_HIDE_DELAY_MS=250`, `MAX_STEPS_PER_COMMAND=12`, `NORMALIZED_GRID=1000`)
-4. In `main.py`: Initialize Windows DPI awareness with `ctypes.windll.shcore.SetProcessDpiAwareness(2)` and set `pyautogui.FAILSAFE = True` as a compatibility/visual cue only. The actual emergency abort should come from the `pynput` `Esc` listener.
-5. Add basic logging and error handling setup.
-6. Write a simple `main.py` that just prints "Agent starting..." for now.
+1. Create the directory structure (`ui/`, `automation/`, `core/`, `utils/`, `prompts/`).
+2. Generate `requirements.txt` and `config.py` with all thresholds above.
+3. **DPI-Aware Bootstrapping (`main.py`)**: Declare strict Win32 argument types for `SetProcessDpiAwarenessContext`, passing handle variables explicitly to prevent coordinate mismatching. Set `pyautogui.FAILSAFE = True` purely as a secondary compatibility visual trigger.
+4. **Circuit Breaker (`core/safety.py`)**: Implement `ApiCircuitBreaker`, tracking structural network errors inside a sliding time window. On breaching `CIRCUIT_BREAKER_FAILURE_THRESHOLD`, trip into an **OPEN** state for `CIRCUIT_BREAKER_TIMEOUT` (120s) to prevent API burning.
+5. **Threaded Watchdog (`core/safety.py`)**: Implement a dedicated, isolated Watchdog thread tracking the primary execution loop's heartbeat.
+6. Add basic logging and error-handling setup; `main.py` prints "Agent starting..." for now.
 
-**Deliverable**: Runnable skeleton with `python main.py` working (run as Admin).
-
----
-
-## Phase 2: UI Layer (Floating Spotlight)
-
-**Objective**: Implement the hotkey-triggered floating input window.
-
-**Steps for LLM**:
-1. Implement `ui/spotlight.py` using **PyQt6**:
-   - Borderless, semi-transparent window
-   - Centered on the primary monitor
-   - Text input field
-   - Global hotkey listener (`Ctrl+Space`) using `pynput`
-   - Add emergency abort (hold `Esc`)
-2. **Critical**: Add thread-safe signals (`pyqtSignal`) for showing/hiding — never call Qt methods directly from pynput listener thread. Add abort handler from background thread.
-3. Style it to look like Spotlight/Raycast.
-4. On Enter: hide window, emit command to coordinator to start loop.
-
-**Milestone**: Standalone UI component that can send text commands.
+**Deliverable**: Runnable skeleton (`python main.py`, run as Admin) with config, DPI bootstrap, circuit breaker, and watchdog scaffolding.
 
 ---
 
-## Phase 3: OS Automation Layer
+## Phase 2: Atomic Data Layer & Versioned Event Store
 
-**Objective**: Screen capture and input execution.
+**Objective**: Build a thread-safe, append-only persistence layer supporting atomic state writes, structural forensics, and crash recovery.
 
 **Steps for LLM**:
-1. Implement `automation/capture.py`:
-   - Use `mss` for **primary monitor only** (Monitor 0)
-   - Return in-memory JPEG bytes
-2. Implement `automation/input_emulator.py`:
-   - Use **pynput.mouse.Controller** or `ctypes.windll.user32.SetCursorPos` for accurate physical clicks/movement.
+1. **Schema Versioning (`core/event_store.py`)**: Implement `EventStore` on SQLite with Write-Ahead Logging (`PRAGMA journal_mode=WAL;`). Embed a strict internal `schema_info` validation checkpoint tracking `STATE_SCHEMA_VERSION = 1`.
+2. **FSM Enforcement**: Structure log interactions to track distinct execution modes (`AgentMode`):
+   - **NORMAL** — Standard step cycle
+   - **LOCAL_RETRY** — Executing local corrective adjustments
+   - **REFLECTING** — Self-diagnosing execution stagnation
+   - **REPLANNING** — Re-indexing the active subtask tree layout
+   - **FINISHED** — Graceful completion
+   - **FAILED** — Exceeded internal structural failure budgets
+   - **CRASHED** — Watchdog-terminated lockups
+3. **Telemetry Tracking**: Force all state transitions through `transition_to(target_mode)`, writing automated transition records directly into the append-only table.
+4. Bound retained history with `MAX_EVENTSTORE_ENTRIES` and `MAX_SCREENSHOT_HISTORY`.
+
+**Milestone**: Versioned, append-only event store with FSM-aware transitions and bounded growth.
+
+---
+
+## Phase 3: Modern Spotlight UI & Status HUD
+
+**Objective**: Implement the hotkey-activated query input and non-intrusive runtime overlay widgets.
+
+**Steps for LLM**:
+1. **Spotlight Geometry (`ui/spotlight.py`)**: Construct a borderless, translucent PyQt6 search window. Use a low-level `pynput` daemon thread to wire the global `Ctrl+Space` activation safely. Add emergency abort (hold `Esc`).
+2. **Critical**: Use thread-safe `pyqtSignal` for all show/hide and abort operations — never call Qt methods directly from the pynput listener or coordinator thread.
+3. **Win32 Focus Injection**: Immediately after layout realization, map native Win32 APIs (`AttachThreadInput`, `SetForegroundWindow`, `SetFocus`) to lock OS input attention and mitigate keyboard focus drop.
+4. **Status HUD (`ui/hud.py`)**: Build a click-through, non-activating floating progress widget showing the current `AgentMode` + progress. Enforce `SetWindowDisplayAffinity(handle, WDA_EXCLUDEFROMCAPTURE)` so the HUD is systematically removed from desktop screenshots.
+5. On Enter: hide Spotlight, emit command to coordinator to start the loop.
+
+**Milestone**: Standalone UI that sends commands and a HUD that never appears in captures.
+
+---
+
+## Phase 4: OS Automation & Absolute Remapping
+
+**Objective**: Implement precision screen interaction utilities working in absolute coordinates.
+
+**Steps for LLM**:
+1. **Screen Capture (`automation/capture.py`)**: Extract raw primary monitor frames (Monitor 0) into in-memory arrays via `mss`; return in-memory JPEG bytes.
+2. **Absolute Inverse Math (`utils/image_processor.py`)**: Resize maintaining aspect ratio (max 1280px) and store `ProcessedImage.scale_x` / `scale_y`. Write remapping formulas that decode positions from scaled-down screenshots back into real physical display pixels by dividing coordinates against stored scaling values:
+   ```math
+   scale_x = physical_width  / processed_width
+   scale_y = physical_height / processed_height
+   final_physical_x = grok_x * scale_x
+   final_physical_y = grok_y * scale_y
+   ```
+3. **Input Emulator (`automation/input_emulator.py`)**: Use **pynput.mouse.Controller** or `ctypes.windll.user32.SetCursorPos` for accurate physical clicks/movement.
    - `click_at(x, y)` with smooth movement (0.2s duration)
-   - `type_string(text)`: **Implement clipboard context manager with 100ms sleep** after paste, and use `pynput` for the paste key sequence instead of `pyautogui.hotkey`.
-   - `press_key(key_name)` (support common keys like enter, tab, etc.)
-   - `scroll(direction: str, amount: int)` implementation
-   - Handle **normalized 0-1000 coordinates** scaling to physical screen resolution
-3. Add DPI verification utility (test mouse movement to physical corners).
-4. Add cursor position logic.
+   - `type_string(text)`: clipboard context manager with 100ms sleep after paste, using `pynput` for the paste key sequence (not `pyautogui.hotkey`)
+   - **Focus-to-Type Delays**: `type_at_coordinates(x, y, text)` clicks to focus, then `time.sleep(0.15)` before pasting so Windows registers active carets
+   - `press_key(key_name)` (enter, tab, backspace, escape, etc.)
+   - **Scroll Unit Normalization**: values ≤ 10 → direct wheel detents; values > 10 → scaled down via `amount // 50` to match pixel targets safely
+4. Add a DPI verification utility (test mouse movement to physical corners).
 
-**Milestone**: Ability to capture screen and perform test clicks/types/presses/scrolls reliably on scaled displays.
+**Milestone**: Reliable capture and click/type/press/scroll on scaled displays using absolute pixel remapping.
 
 ---
 
-## Phase 4: Core Coordinator & Utilities
+## Phase 5: The Cognitive Execution Engine
 
-**Objective**: Glue logic, image processing, and state management.
+**Objective**: Construct the unified coordination loop managing inference processing and deterministic error checking.
 
 **Steps for LLM**:
-1. Implement `utils/image_processor.py`:
-   - Resize image maintaining aspect ratio (max 1280px)
-   - Calculate and store scale_factor for **normalized 0-1000 grid**
-2. Implement `core/database.py`:
-   - SQLite table for interaction_logs
-3. Implement `utils/parser.py`:
-   - Regex extractors for updated tags: `[CLICK:x,y]`, `[TYPE:x,y|text]`, `[PRESS:key_name]`, `[SCROLL:direction:amount]`, and `[DONE]`
-4. Implement `core/coordinator.py`:
-   - Main orchestration class running in **background QThread**.
-   - Fetch recent history from DB (text summaries only)
-   - Build multi-turn message history for API **with current image only**
-   - Enforce `MAX_STEPS_PER_COMMAND`
-   - Use the `pynput` `Esc` listener as the primary abort trigger to set `self.is_running = False` and stop the loop. PyAutoGUI failsafe should remain only as a compatibility indicator, not the relied-upon emergency stop for mouse movement driven by `pynput`/`ctypes`.
+1. **Parser (`utils/parser.py`)**: Regex extractors for `[CLICK:x,y]`, `[TYPE:x,y|text]`, `[PRESS:key_name]`, `[SCROLL:direction:amount]`, and `[DONE]`.
+2. **Deterministic Fingerprinting (`core/coordinator.py`)**:
+   ```python
+   def generate_deterministic_fingerprint(self, failure_summary: str) -> str:
+       normalized = failure_summary.lower().strip().encode('utf-8')
+       return hashlib.sha256(normalized).hexdigest()
+   ```
+3. **Frequency-Based Oscillation Tracking**: Store failure hashes in an aging sliding-window queue `deque(maxlen=3)`. Before triggering a cycle, confirm the active signature count is low:
+   ```python
+   if self.recent_replan_reasons.count(reason_hash) >= config.MAX_OSCILLATION_COUNT:
+       self.transition_to(AgentMode.FAILED,
+           "Infinite loop oscillation detected via telemetry signature tracking.")
+       break
+   ```
+4. **Action Deduplication Guard**: Cache the hash of the last successfully executed step block (`self.last_executed_hash`). If consecutive cycles yield identical action payloads, drop execution immediately.
+5. **Inference Execution (`core/coordinator.py`)**: Build multi-turn system prompts passing conversation logs as **text context**, embedding the desktop image **only in the final user message frame**. Load the system prompt from `prompts/system_prompt.txt`.
 
-**Milestone**: Coordinator can process a command with context and return parsed actions in background thread.
+**Milestone**: Coordinator processes a command with context, fingerprints failures, detects oscillation, dedups actions, and returns parsed actions.
 
 ---
 
-## Phase 5: AI Engine Integration
+## Phase 6: Full Integration & Watchdog Telemetry
 
-**Objective**: Connect to Grok Vision API.
+**Objective**: Combine subsystems into a robust execution loop that can recover from crashes.
 
 **Steps for LLM**:
-1. Create API client in `core/coordinator.py`.
-2. Implement payload construction supporting **multi-turn conversation messages**. 
-   - Only the **latest user message** includes the current Base64 screenshot.
-   - All prior assistant/user messages in history are text-only summaries of actions and results.
-3. Use `httpx` for POST to `https://api.x.ai/v1/chat/completions`.
-4. Handle response parsing including new action tags (`[TYPE:x,y|text]`).
-5. Load system prompt from `prompts/system_prompt.txt`.
+1. **Single Worker Lifecycle (`core/coordinator.py`)**: Launch the primary coordinator loop on an independent `QThread`. Avoid distributed executors; rely on cooperative `self.is_running` monitoring to prevent thread leaks.
+2. Implement the **multi-step loop**: Capture → remap → send to Grok with text history → parse → fingerprint/dedup/oscillation check → execute → log → update HUD → repeat. Break on `[DONE]`, hard budgets (`MAX_ACTIONS`, `MAX_RUNTIME_MINUTES`, `MAX_CONSECUTIVE_FAILURES`), oscillation, or manual `Esc` abort.
+3. Add **250ms** delay (configurable) after hiding the UI before the first capture.
+4. **Watchdog Telemetry Hooks**: If the coordinator hits an un-alertable OS wait or locks up, the external Watchdog triggers an override:
+   ```python
+   def handle_watchdog_crash(self, diagnostic_reason: str):
+       self.is_running = False
+       self.transition_to(AgentMode.CRASHED, context=diagnostic_reason)
+       self._event_store.log_event(self.current_mode, "WATCHDOG_TERMINATION",
+           {"error": "Vitality heartbeat failed.", "trace": diagnostic_reason})
+       # Fire emergency UI state restorations...
+   ```
+5. **Dual Stagnation Check**: Track elapsed time since last success alongside structural loop iterations. If `MAX_STUCK_TIME` (temporal) or `MAX_SEMANTIC_STAGNATION_STEPS` (semantic) is crossed, force a `REFLECTING` sequence.
+6. **Crash Recovery Validation (`resume_session()`)**: On startup, parse the persistent EventStore. If the last recorded index reads `CRASHED`, pull cached subtask parameters to safely restore agent state.
 
-**Milestone**: End-to-end call with conversation history context.
-
----
-
-## Phase 6: Full Integration & Main Loop
-
-**Objective**: Wire everything together with continuous execution.
-
-**Steps for LLM**:
-1. Update `main.py` to initialize all components.
-2. Implement the **multi-step while loop** inside the background worker thread in coordinator:
-   - Capture → Send to Grok with history → Parse → Execute → Log → Repeat
-   - Break loop on `[DONE]`, error threshold, max steps, or manual abort (including FailSafe).
-3. Add **250ms** delay (configurable) after hiding UI before first capture.
-4. **Normalized coordinate scaling** using physical dimensions.
-5. Add user feedback (notifications/toasts on actions and completion).
-6. **Robust error handling** including full loop termination on failsafe.
-
-**Milestone**: Full working prototype with autonomous multi-step task execution triggered by hotkey and responsive UI.
+**Milestone**: Full working prototype with autonomous, watchdog-supervised multi-step execution and crash recovery.
 
 ---
 
-## Phase 7: Prompt Engineering & Refinement
+## Phase 7: Production Rigor & Verification Scenarios
 
-**Objective**: Make AI responses reliable.
-
-(unchanged, with emphasis on new action formats)
-
----
-
-## Phase 8: Error Handling, Edge Cases & Polish
-
-**Objective**: Production readiness.
-
-**Additional focus**:
-- Verify background thread prevents UI freeze.
-- Test failsafe abort (mouse to corner immediately stops and restores UI).
-- Confirm clipboard paste with delay.
-- Test on 100%/125%/150% scaling.
-
----
-
-## Phase 9: Testing & Iteration
+**Objective**: Validate system performance under real-world operating conditions and failure states.
 
 **Test Scenarios**:
-- ... (same)
-- Specifically test failsafe, threading, clipboard, coordinates.
+- Coordinate accuracy on 100% / 125% / 150% scaling (absolute remapping).
+- Circuit breaker trips after repeated API errors and recovers after cooldown.
+- Watchdog terminates a simulated lockup and recovery restores UI/state.
+- Oscillation detection breaks an induced repeating-failure loop.
+- Action dedup guard drops identical consecutive payloads.
+- Crash resume (`resume_session()`) restores from a `CRASHED` record.
+- Clipboard backup/restore with delay; click-to-type focus delay; scroll normalization.
+- HUD confirmed absent from screenshots (`WDA_EXCLUDEFROMCAPTURE`).
+- `Esc` abort immediately stops the loop and restores the UI.
 
 **Final Steps**:
-1. Create a README.md with setup and usage instructions (emphasize Run as Admin).
-2. Add `.gitignore`
-3. Optional: Packaging (PyInstaller for executable)
+1. Create a `README.md` with setup and usage instructions (emphasize Run as Admin).
+2. Add `.gitignore`.
+3. Optional: Packaging (PyInstaller for executable).
 
 ---
 
 ## Development Workflow Tips for the LLM
 
-- **Iterate Phase by Phase**
-- Reference updated HLD for threading, DPI, clipboard fixes.
+- **Iterate Phase by Phase** — safety primitives and persistence (Phases 1–2) come before UI and automation.
+- Reference the updated HLD for the FSM, watchdog, circuit breaker, absolute coordinate remapping, EventStore, and HUD-exclusion details.
 - **Next Action**: Start with **Phase 1**. Once complete, confirm and proceed to Phase 2.
 
-This plan ensures systematic, low-risk development with the addressed critical fixes.
+This plan ensures systematic, low-risk development toward a hardened, self-recovering production agent.
