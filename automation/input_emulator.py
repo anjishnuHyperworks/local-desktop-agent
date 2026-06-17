@@ -1,5 +1,5 @@
 """
-Phase 3: Input Emulator
+Input Emulator
 
 DPI-aware mouse movement, clicking, keyboard input, scrolling, and diagnostics.
 

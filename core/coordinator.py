@@ -1,11 +1,19 @@
 """
-Phase 5: Core Coordinator — Real Grok Vision API Integration
+Core Coordinator — capture → reason → act orchestration
 
 The Coordinator is the central orchestrator of the automation loop.  It runs
 exclusively inside a dedicated QThread worker and communicates with the UI
 through Qt signals only — it never touches widgets directly.
 
-Threading model (mandatory for Phase 4+):
+Each command is first classified as CHAT (answered directly, streamed back to
+the Spotlight panel) or AUTOMATION.  For automation, a lightweight planner
+decomposes the goal into sequential tasks, then the high-frequency
+capture → reason → action loop executes them.  When progress stalls the agent
+escalates through AgentMode states (NORMAL → LOCAL_RETRY → REFLECTING →
+REPLANNING) to recover, advancing the plan via [TASK_COMPLETE] and finishing on
+[DONE].
+
+Threading model:
     1. UI thread creates Coordinator and a QThread.
     2. coordinator.moveToThread(worker_thread) — Coordinator lives in that thread.
     3. UI emits command_submitted signal (connected to coordinator.start_command).
@@ -19,28 +27,28 @@ Signal inventory (all emitted from the worker thread):
     intent_signal(str)        — "CHAT" or "AUTOMATION", emitted once per command
                                 after classification so the UI can pick a flow
     chat_response_signal(str) — the answer text for a pure-chat command
+    chat_token_signal(str)    — incremental token chunk for streaming chat
     finished_signal(str)      — task completed normally ([DONE] received)
     error_signal(str)         — task ended due to an error or max-step overflow
     abort_signal()            — task stopped because the user pressed Esc
 
-Mock AI mode (Phase 4):
-    use_mock_ai=True replaces Grok API calls with a fixed script:
-        Step 1 → [CLICK:500,500]
-        Step 2 → [TYPE:500,500|hello]
-        Step 3 → [DONE]
-    This lets the entire pipeline — parser, DB, signals, state machine — be
-    validated end-to-end without network access.
-
-Phase 5:
-    use_mock_ai=False sends real httpx requests to the Grok Vision API.
-    Screenshot is captured, resized, base64-encoded, and sent alongside
-    conversation history and the system prompt.
+AI modes:
+    use_mock_ai=True replaces API calls with a fixed script that exercises the
+    full pipeline — parser, DB, signals, planning/state machine — without
+    network access:
+        [CLICK:500,500] → [TASK_COMPLETE] → [TYPE:500,500|hello]
+        → [TASK_COMPLETE] → [DONE]
+    use_mock_ai=False sends real httpx requests to the vision model: the
+    screenshot is captured, resized, base64-encoded, and sent alongside the
+    plan context, conversation history, and the system prompt.
 """
 
 import base64
 import json
 import logging
 import time
+from dataclasses import dataclass
+from enum import Enum
 from typing import Optional
 
 _perf = logging.getLogger("perf")
@@ -56,6 +64,53 @@ from utils.image_processor import ImageProcessor
 from utils.parser import ActionParser, ActionType, ParsedAction
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Planning Data Structures
+# ---------------------------------------------------------------------------
+
+class TaskStatus(Enum):
+    """Status of a task in the plan."""
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    SKIPPED = "skipped"
+
+
+@dataclass
+class Task:
+    """A single task in the execution plan."""
+    description: str
+    status: TaskStatus = TaskStatus.PENDING
+
+
+@dataclass
+class Plan:
+    """A sequential plan of tasks for long-horizon execution."""
+    goal: str
+    tasks: list[Task]
+    current_index: int = 0
+
+
+@dataclass
+class ReflectionResult:
+    """Structured output from reflection phase."""
+    root_cause: str
+    failed_strategy: str
+    discovered_information: str
+    recommendation: str
+
+
+class AgentMode(Enum):
+    """Execution mode of the agent."""
+    NORMAL = "normal"
+    LOCAL_RETRY = "local_retry"
+    REFLECTING = "reflecting"
+    REPLANNING = "replanning"
+    FINISHED = "finished"
+    FAILED = "failed"
+    CRASHED = "crashed"
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +183,11 @@ class Coordinator(QObject):
         self.current_step: int = 0
         self.current_command: str = ""
         self.use_mock_ai: bool = use_mock_ai
+        self.total_actions: int = 0  # Tracks total actions across all commands
+        self.current_mode: AgentMode = AgentMode.NORMAL
+        self.current_plan: Optional[Plan] = None
+        self.current_reflection: Optional[ReflectionResult] = None
+        self.replan_count: int = 0
 
         # Resize scale of the most recently sent screenshot. The model emits
         # coordinates in resized-image pixels; dividing by these recovers
@@ -139,7 +199,9 @@ class Coordinator(QObject):
         # Cycled through in order; after exhaustion [DONE] is returned.
         self._mock_responses: list[str] = [
             "[CLICK:500,500]",
+            "[TASK_COMPLETE]",
             "[TYPE:500,500|hello]",
+            "[TASK_COMPLETE]",
             "[DONE]",
         ]
 
@@ -151,6 +213,317 @@ class Coordinator(QObject):
             self.use_mock_ai,
             self._db._db_path,
         )
+
+    # ------------------------------------------------------------------
+    # Planner
+    # ------------------------------------------------------------------
+
+    def create_plan(self, goal: str) -> Plan:
+        """
+        Decompose the user's objective into a sequential list of tasks.
+
+        This runs once at the beginning of a command. The planner is
+        infrequent and therefore does not significantly affect latency.
+
+        Args:
+            goal: The user's command/objective
+
+        Returns:
+            A Plan with a list of tasks to accomplish the goal
+        """
+        if self.use_mock_ai:
+            # Mock planner returns a simple 3-step plan
+            tasks = [
+                Task(description="Analyze the current screen state"),
+                Task(description="Execute the requested action"),
+                Task(description="Verify completion"),
+            ]
+            return Plan(goal=goal, tasks=tasks, current_index=0)
+
+        # Real planner calls the AI to decompose the goal
+        planner_prompt = (
+            "You are a task planner for a desktop automation agent.\n"
+            "Decompose the user's goal into a sequential list of specific, actionable tasks.\n"
+            "Each task should be a single step that can be accomplished by observing the screen "
+            "and taking one or more actions (click, type, scroll, press).\n\n"
+            f"User Goal: {goal}\n\n"
+            "Output your response as a numbered list of tasks, one per line. "
+            "Be specific but concise. Example:\n"
+            "1. Open Chrome browser\n"
+            "2. Navigate to Google Sheets\n"
+            "3. Inspect the spreadsheet\n"
+        )
+
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.post(
+                    config.GROK_API_URL,
+                    json={
+                        "model": config.GROK_MODEL,
+                        "messages": [
+                            {"role": "system", "content": planner_prompt},
+                            {"role": "user", "content": goal},
+                        ],
+                    },
+                    headers={"Authorization": f"Bearer {config.GROK_API_KEY}"},
+                )
+            response.raise_for_status()
+            result = response.json()["choices"][0]["message"]["content"].strip()
+
+            # Parse the numbered list into tasks
+            tasks = []
+            for line in result.split('\n'):
+                line = line.strip()
+                if line and (line[0].isdigit() or line.startswith('-')):
+                    # Remove the number/bullet and any leading punctuation
+                    task_desc = line.split('.', 1)[-1].split('-', 1)[-1].strip()
+                    if task_desc:
+                        tasks.append(Task(description=task_desc))
+
+            if not tasks:
+                # Fallback if parsing failed
+                tasks = [Task(description=goal)]
+
+            logger.info("Planner created %d tasks for goal: %s", len(tasks), goal)
+            return Plan(goal=goal, tasks=tasks, current_index=0)
+
+        except Exception as exc:
+            logger.error("Planner failed, using fallback: %s", exc)
+            # Fallback: single task with the original goal
+            tasks = [Task(description=goal)]
+            return Plan(goal=goal, tasks=tasks, current_index=0)
+
+    # ------------------------------------------------------------------
+    # Reflection
+    # ------------------------------------------------------------------
+
+    def reflect(self, recent_history: str) -> ReflectionResult:
+        """
+        Perform self-diagnosis when progress has stalled.
+
+        This is triggered when the agent enters REFLECTING mode. It produces
+        a structured ReflectionResult that will be used by the replanner.
+
+        Args:
+            recent_history: Recent execution history for context
+
+        Returns:
+            A ReflectionResult with structured diagnosis
+        """
+        if self.use_mock_ai:
+            # Mock reflection returns a simple diagnosis
+            return ReflectionResult(
+                root_cause="Task execution stalled",
+                failed_strategy="Direct action execution",
+                discovered_information="Screen state did not change as expected",
+                recommendation="Try a different approach or break down the task further"
+            )
+
+        reflection_prompt = (
+            "You are a desktop automation agent performing self-diagnosis.\n"
+            "Your previous approach has stalled and you need to understand why.\n\n"
+            f"Current Goal: {self.current_command}\n"
+            f"Recent Execution History:\n{recent_history}\n\n"
+            "Analyze the situation and provide:\n"
+            "1. Root cause: Why did progress stall?\n"
+            "2. Failed strategy: What approach didn't work?\n"
+            "3. Discovered information: What did you learn?\n"
+            "4. Recommendation: What should you try instead?\n\n"
+            "Format your response as a JSON object with these four keys:\n"
+            "{\n"
+            '  "root_cause": "...",\n'
+            '  "failed_strategy": "...",\n'
+            '  "discovered_information": "...",\n'
+            '  "recommendation": "..."\n'
+            "}\n"
+        )
+
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.post(
+                    config.GROK_API_URL,
+                    json={
+                        "model": config.GROK_MODEL,
+                        "messages": [
+                            {"role": "system", "content": reflection_prompt},
+                            {"role": "user", "content": recent_history},
+                        ],
+                    },
+                    headers={"Authorization": f"Bearer {config.GROK_API_KEY}"},
+                )
+            response.raise_for_status()
+            result = response.json()["choices"][0]["message"]["content"].strip()
+
+            # Parse JSON response
+            try:
+                import re
+                # Extract JSON from response (in case there's surrounding text)
+                json_match = re.search(r'\{.*\}', result, re.DOTALL)
+                if json_match:
+                    result = json_match.group(0)
+
+                reflection_data = json.loads(result)
+                return ReflectionResult(
+                    root_cause=reflection_data.get("root_cause", "Unknown cause"),
+                    failed_strategy=reflection_data.get("failed_strategy", "Unknown strategy"),
+                    discovered_information=reflection_data.get("discovered_information", "No new information"),
+                    recommendation=reflection_data.get("recommendation", "Try a different approach")
+                )
+            except json.JSONDecodeError:
+                logger.error("Failed to parse reflection JSON, using fallback")
+                return ReflectionResult(
+                    root_cause="Parsing error",
+                    failed_strategy="Reflection parsing",
+                    discovered_information="Could not parse reflection output",
+                    recommendation="Proceed with generic recovery strategy"
+                )
+
+        except Exception as exc:
+            logger.error("Reflection failed, using fallback: %s", exc)
+            return ReflectionResult(
+                root_cause="Reflection API error",
+                failed_strategy="Reflection call",
+                discovered_information=f"Error: {exc}",
+                recommendation="Attempt to continue with current strategy"
+            )
+
+    # ------------------------------------------------------------------
+    # Replanning
+    # ------------------------------------------------------------------
+
+    def replan(self, reflection: ReflectionResult) -> Plan:
+        """
+        Revise the remaining tasks based on reflection results.
+
+        This is triggered when the agent enters REPLANNING mode. It modifies
+        only the remaining tasks in the plan, using the reflection to guide
+        the revision.
+
+        Args:
+            reflection: The structured reflection result from the reflect() call
+
+        Returns:
+            An updated Plan with revised remaining tasks
+        """
+        if self.current_plan is None:
+            logger.warning("Replan called with no current plan, creating new plan")
+            return self.create_plan(self.current_command)
+
+        # Get remaining tasks
+        remaining_tasks = self.current_plan.tasks[self.current_plan.current_index:]
+        remaining_descriptions = [task.description for task in remaining_tasks]
+
+        if self.use_mock_ai:
+            # Mock replanner adds a diagnostic step before remaining tasks
+            new_tasks = [
+                Task(description=f"Address issue: {reflection.root_cause}"),
+                Task(description=f"Try alternative: {reflection.recommendation}"),
+                *remaining_tasks
+            ]
+            updated_plan = Plan(
+                goal=self.current_plan.goal,
+                tasks=new_tasks,
+                current_index=0
+            )
+            logger.info("Mock replanner revised plan with %d tasks", len(new_tasks))
+            return updated_plan
+
+        # Real replanner uses reflection to revise remaining tasks
+        replan_prompt = (
+            "You are a task replanner for a desktop automation agent.\n"
+            "Your previous approach has stalled and you need to revise the remaining tasks.\n\n"
+            f"Current Goal: {self.current_plan.goal}\n"
+            f"Remaining Tasks:\n" + "\n".join(f"{i+1}. {desc}" for i, desc in enumerate(remaining_descriptions)) + "\n\n"
+            f"Reflection Summary:\n"
+            f"Root Cause: {reflection.root_cause}\n"
+            f"Failed Strategy: {reflection.failed_strategy}\n"
+            f"Discovered Information: {reflection.discovered_information}\n"
+            f"Recommendation: {reflection.recommendation}\n\n"
+            "Revise only the remaining tasks. Avoid repeating the failed approach. "
+            "Output your response as a numbered list of revised tasks, one per line.\n"
+        )
+
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.post(
+                    config.GROK_API_URL,
+                    json={
+                        "model": config.GROK_MODEL,
+                        "messages": [
+                            {"role": "system", "content": replan_prompt},
+                            {"role": "user", "content": f"Revise these tasks:\n" + "\n".join(remaining_descriptions)},
+                        ],
+                    },
+                    headers={"Authorization": f"Bearer {config.GROK_API_KEY}"},
+                )
+            response.raise_for_status()
+            result = response.json()["choices"][0]["message"]["content"].strip()
+
+            # Parse the numbered list into new tasks
+            new_tasks = []
+            for line in result.split('\n'):
+                line = line.strip()
+                if line and (line[0].isdigit() or line.startswith('-')):
+                    # Remove the number/bullet and any leading punctuation
+                    task_desc = line.split('.', 1)[-1].split('-', 1)[-1].strip()
+                    if task_desc:
+                        new_tasks.append(Task(description=task_desc))
+
+            if not new_tasks:
+                # Fallback if parsing failed - keep original remaining tasks
+                logger.warning("Replanner parsing failed, keeping original remaining tasks")
+                new_tasks = remaining_tasks
+
+            # Combine completed tasks with new remaining tasks
+            completed_tasks = self.current_plan.tasks[:self.current_plan.current_index]
+            updated_plan = Plan(
+                goal=self.current_plan.goal,
+                tasks=completed_tasks + new_tasks,
+                current_index=len(completed_tasks)
+            )
+
+            self.replan_count += 1
+            logger.info("Replanner revised plan with %d new tasks (replan #%d)", len(new_tasks), self.replan_count)
+            return updated_plan
+
+        except Exception as exc:
+            logger.error("Replanner failed, keeping original plan: %s", exc)
+            # Fallback: keep the original plan
+            return self.current_plan
+
+    # ------------------------------------------------------------------
+    # Plan progression
+    # ------------------------------------------------------------------
+
+    def _advance_task(self) -> bool:
+        """
+        Mark the current plan task COMPLETED and advance to the next one.
+
+        Returns:
+            True if there are still pending tasks after advancing,
+            False if the plan is exhausted (all tasks done).
+        """
+        plan = self.current_plan
+        if plan is None or plan.current_index >= len(plan.tasks):
+            return False
+
+        plan.tasks[plan.current_index].status = TaskStatus.COMPLETED
+        plan.current_index += 1
+
+        if plan.current_index < len(plan.tasks):
+            next_task = plan.tasks[plan.current_index]
+            next_task.status = TaskStatus.IN_PROGRESS
+            logger.info(
+                "Advanced to task %d/%d: %s",
+                plan.current_index + 1, len(plan.tasks), next_task.description,
+            )
+            self.status_signal.emit(
+                f"Task {plan.current_index + 1}/{len(plan.tasks)}: {next_task.description}"
+            )
+            return True
+
+        logger.info("All %d plan tasks completed", len(plan.tasks))
+        return False
 
     # ------------------------------------------------------------------
     # Slot: start execution (called via queued connection from UI thread)
@@ -185,6 +558,8 @@ class Coordinator(QObject):
         self.is_running = True  # lock before classification to block concurrent commands
         self.current_command = command
         self.current_step = 0
+        self.current_mode = AgentMode.NORMAL
+        self.replan_count = 0
 
         self.status_signal.emit("Analyzing intent...")
 
@@ -204,6 +579,14 @@ class Coordinator(QObject):
             else:
                 logger.info("Routing to Desktop Automation loop.")
                 self.status_signal.emit(f"Starting automation: {command}")
+
+                # Create plan at the beginning of automation
+                _t0 = time.perf_counter()
+                self.current_plan = self.create_plan(command)
+                if self.current_plan.tasks:
+                    self.current_plan.tasks[0].status = TaskStatus.IN_PROGRESS
+                _perf.info("[latency] planning=%.3fs", time.perf_counter() - _t0)
+
                 # run_loop() manages is_running internally
                 self.run_loop()
 
@@ -368,7 +751,33 @@ class Coordinator(QObject):
         except Exception as exc:
             logger.error("Action execution failed: %s - %s", action, exc)
             self.status_signal.emit(f"Action failed: {type(exc).__name__}")
+            self._consecutive_failures += 1
+            self._steps_without_progress += 1
             return "error"
+
+    def _check_stagnation(self) -> bool:
+        """
+        Check if execution has stalled and requires recovery.
+
+        Returns True if stagnation is detected, False otherwise.
+        """
+        # Check temporal stagnation (no progress for too long)
+        time_since_success = time.perf_counter() - self._last_success_time
+        if time_since_success > config.MAX_STUCK_TIME_S:
+            logger.warning("Stagnation detected: no progress for %.1fs", time_since_success)
+            return True
+
+        # Check semantic stagnation (too many steps without state advancement)
+        if self._steps_without_progress > config.MAX_SEMANTIC_STAGNATION_STEPS:
+            logger.warning("Stagnation detected: %d steps without progress", self._steps_without_progress)
+            return True
+
+        # Check consecutive failures
+        if self._consecutive_failures >= config.MAX_CONSECUTIVE_FAILURES:
+            logger.warning("Stagnation detected: %d consecutive failures", self._consecutive_failures)
+            return True
+
+        return False
 
     # ------------------------------------------------------------------
     # Main execution loop (runs entirely in the worker thread)
@@ -376,11 +785,12 @@ class Coordinator(QObject):
 
     def run_loop(self) -> None:
         """
-        The main capture-reason-execute cycle.
+        The main capture-reason-execute cycle with planning and reflection.
 
         Termination conditions (deterministic, mutually exclusive):
             DONE tag received      → finished_signal emitted
             Max steps exceeded     → error_signal emitted
+            Max actions exceeded   → error_signal emitted
             stop_command() called  → abort_signal emitted (and nothing else)
             Unhandled exception    → error_signal emitted
 
@@ -392,43 +802,107 @@ class Coordinator(QObject):
 
         _loop_start = time.perf_counter()
         logger.info(
-            "run_loop started — command=%r, max_steps=%d, mock=%s",
+            "run_loop started — command=%r, max_steps=%d, max_actions=%d, mock=%s",
             self.current_command,
             config.MAX_STEPS_PER_COMMAND,
+            config.MAX_ACTIONS,
             self.use_mock_ai,
         )
+
+        # Stagnation tracking
+        self._last_success_time = time.perf_counter()
+        self._consecutive_failures = 0
+        self._steps_without_progress = 0
+        self._retry_attempted = False   # escalation stage: LOCAL_RETRY → REFLECTING
 
         try:
             while (
                 self.is_running
                 and self.current_step < config.MAX_STEPS_PER_COMMAND
+                and self.total_actions < config.MAX_ACTIONS
             ):
                 self.current_step += 1
+                self.total_actions += 1
                 logger.info(
-                    "Loop iteration %d/%d",
+                    "Loop iteration %d/%d (total actions: %d/%d, mode: %s)",
                     self.current_step,
                     config.MAX_STEPS_PER_COMMAND,
+                    self.total_actions,
+                    config.MAX_ACTIONS,
+                    self.current_mode.value,
                 )
 
                 # Emit step progress to the UI.
+                if self.current_plan and self.current_plan.current_index < len(self.current_plan.tasks):
+                    current_task = self.current_plan.tasks[self.current_plan.current_index]
+                    task_info = f"Task {self.current_plan.current_index + 1}/{len(self.current_plan.tasks)}: {current_task.description}"
+                else:
+                    task_info = "Executing..."
                 self.status_signal.emit(
-                    f"Step {self.current_step}/{config.MAX_STEPS_PER_COMMAND} …"
+                    f"Step {self.current_step}/{config.MAX_STEPS_PER_COMMAND} — {task_info}"
                 )
 
-                # Execute one reasoning + action cycle.
-                done = self.process_single_step()
-
-                if done:
-                    # [DONE] received — normal completion.
-                    logger.info("run_loop: [DONE] received — finishing normally")
-                    _perf.info(
-                        "[latency] total_automation_loop=%.3fs steps=%d",
-                        time.perf_counter() - _loop_start,
-                        self.current_step,
+                # Execute one reasoning + action cycle based on current mode
+                if self.current_mode == AgentMode.NORMAL:
+                    if self._handle_step_outcome(self.process_single_step(), _loop_start):
+                        return
+                elif self.current_mode == AgentMode.REFLECTING:
+                    # Perform reflection
+                    self.status_signal.emit("Reflecting on stalled progress...")
+                    recent_history = self.build_history_context()
+                    self.current_reflection = self.reflect(recent_history)
+                    logger.info(
+                        "Reflection result: root_cause=%s, recommendation=%s",
+                        self.current_reflection.root_cause,
+                        self.current_reflection.recommendation,
                     )
-                    self.is_running = False
-                    self.finished_signal.emit("Task completed successfully.")
-                    return
+                    # Transition to REPLANNING
+                    self.current_mode = AgentMode.REPLANNING
+                    continue
+                elif self.current_mode == AgentMode.REPLANNING:
+                    # Perform replanning
+                    if self.replan_count >= config.MAX_REPLANS:
+                        logger.warning("Max replans reached, failing")
+                        self.is_running = False
+                        self.error_signal.emit("Task failed: Maximum replans exceeded.")
+                        return
+                    self.status_signal.emit("Replanning based on reflection...")
+                    self.current_plan = self.replan(self.current_reflection)
+                    # Transition back to NORMAL with a clean recovery slate so the
+                    # next stall (if any) re-escalates from LOCAL_RETRY.
+                    self.current_mode = AgentMode.NORMAL
+                    self._consecutive_failures = 0
+                    self._steps_without_progress = 0
+                    self._last_success_time = time.perf_counter()
+                    self._retry_attempted = False
+                    continue
+                elif self.current_mode == AgentMode.LOCAL_RETRY:
+                    # Execute a retry step
+                    outcome = self.process_single_step()
+                    if self._handle_step_outcome(outcome, _loop_start):
+                        return
+                    if outcome == ActionType.TASK_COMPLETE:
+                        # Retry succeeded in finishing the task — back to NORMAL.
+                        self.current_mode = AgentMode.NORMAL
+                        continue
+                    # If retry produced no progress, transition to REFLECTING.
+                    self.current_mode = AgentMode.REFLECTING
+                    continue
+
+                # Check for stagnation and trigger state transitions.
+                # Linear escalation per the plan: a fresh stall first attempts a
+                # cheap LOCAL_RETRY; if stagnation is still present afterwards we
+                # escalate to REFLECTING. _retry_attempted tracks the stage so it
+                # is not conflated with the _consecutive_failures tally.
+                if self._check_stagnation():
+                    if not self._retry_attempted:
+                        logger.info("Stagnation detected, entering LOCAL_RETRY")
+                        self.current_mode = AgentMode.LOCAL_RETRY
+                        self._retry_attempted = True
+                    else:
+                        logger.info("Stagnation persists, entering REFLECTING")
+                        self.current_mode = AgentMode.REFLECTING
+                    continue
 
                 # Check abort flag between iterations (stop_command may have
                 # been called while process_single_step was executing).
@@ -451,25 +925,94 @@ class Coordinator(QObject):
                 return
 
             # Loop exited because step limit was reached.
-            logger.warning(
-                "run_loop: max steps (%d) exceeded — aborting",
-                config.MAX_STEPS_PER_COMMAND,
-            )
-            self.is_running = False
-            self.error_signal.emit(
-                "Task aborted: Maximum execution steps exceeded."
-            )
+            if self.current_step >= config.MAX_STEPS_PER_COMMAND:
+                logger.warning(
+                    "run_loop: max steps (%d) exceeded — aborting",
+                    config.MAX_STEPS_PER_COMMAND,
+                )
+                self.is_running = False
+                self.error_signal.emit(
+                    "Task aborted: Maximum execution steps exceeded."
+                )
+            elif self.total_actions >= config.MAX_ACTIONS:
+                logger.warning(
+                    "run_loop: max actions (%d) exceeded — aborting",
+                    config.MAX_ACTIONS,
+                )
+                self.is_running = False
+                self.error_signal.emit(
+                    "Task aborted: Maximum actions exceeded."
+                )
 
         except Exception as exc:
             logger.exception("run_loop: fatal unhandled exception: %s", exc)
             self.is_running = False
             self.error_signal.emit(f"Fatal error encountered: {exc}")
 
+    def _handle_step_outcome(
+        self, outcome: Optional[ActionType], loop_start: float
+    ) -> bool:
+        """
+        Interpret a control outcome from process_single_step().
+
+        DONE finishes the goal — but only when the plan has no pending tasks.
+        Models often emit [DONE] after finishing a single subtask (meaning "this
+        task is done") instead of the correct [TASK_COMPLETE]. When that happens
+        mid-plan we treat [DONE] as [TASK_COMPLETE] so the remaining tasks aren't
+        abandoned. TASK_COMPLETE advances the plan to the next task; if that was
+        the last task, the goal is also finished.
+
+        Returns:
+            True if the goal is complete and run_loop should return,
+            False to keep iterating.
+        """
+        if outcome == ActionType.DONE:
+            plan = self.current_plan
+            mid_plan = (
+                plan is not None
+                and plan.current_index < len(plan.tasks) - 1
+            )
+            if mid_plan:
+                logger.info(
+                    "run_loop: [DONE] received mid-plan (task %d/%d) — "
+                    "treating as [TASK_COMPLETE] to avoid abandoning "
+                    "remaining tasks",
+                    plan.current_index + 1, len(plan.tasks),
+                )
+                self._advance_task()
+                return False
+
+            logger.info("run_loop: [DONE] received — finishing normally")
+            _perf.info(
+                "[latency] total_automation_loop=%.3fs steps=%d",
+                time.perf_counter() - loop_start,
+                self.current_step,
+            )
+            self.is_running = False
+            self.finished_signal.emit("Task completed successfully.")
+            return True
+
+        if outcome == ActionType.TASK_COMPLETE:
+            has_more = self._advance_task()
+            if not has_more:
+                # Final task done — treat as goal completion.
+                logger.info("run_loop: final task complete — finishing")
+                _perf.info(
+                    "[latency] total_automation_loop=%.3fs steps=%d",
+                    time.perf_counter() - loop_start,
+                    self.current_step,
+                )
+                self.is_running = False
+                self.finished_signal.emit("Task completed successfully.")
+                return True
+
+        return False
+
     # ------------------------------------------------------------------
     # Single iteration: fetch AI response → parse → log → return done flag
     # ------------------------------------------------------------------
 
-    def process_single_step(self) -> bool:
+    def process_single_step(self) -> Optional[ActionType]:
         """
         Execute one complete step of the reasoning loop.
 
@@ -481,7 +1024,9 @@ class Coordinator(QObject):
             5. Log the interaction to the database.
 
         Returns:
-            True if the response contained [DONE], False otherwise.
+            ActionType.DONE          if the goal is complete,
+            ActionType.TASK_COMPLETE if the current plan task is complete,
+            None                     to keep iterating.
         """
         _t0_step = time.perf_counter()
 
@@ -493,7 +1038,7 @@ class Coordinator(QObject):
             "process_single_step: history context length=%d chars", len(history)
         )
 
-        # 2. Get AI response (mock for Phase 4).
+        # 2. Get AI response (mock or real).
         _t0 = time.perf_counter()
         raw_response = self.get_ai_response()
         _perf.info("[latency] step=%d ai_response=%.3fs", self.current_step, time.perf_counter() - _t0)
@@ -507,7 +1052,9 @@ class Coordinator(QObject):
         if action is None:
             status_msg = f"AI responded (no action tag): {prose[:80]}"
         elif action.action_type == ActionType.DONE:
-            status_msg = "AI signalled task complete."
+            status_msg = "AI signalled goal complete."
+        elif action.action_type == ActionType.TASK_COMPLETE:
+            status_msg = "AI signalled current task complete."
         else:
             status_msg = f"Action → {action}"
 
@@ -518,10 +1065,23 @@ class Coordinator(QObject):
         action_tag_str = str(action) if action else None
         if action is None:
             execution_result = "skipped"
-        elif action.action_type == ActionType.DONE:
+        elif action.action_type in (ActionType.DONE, ActionType.TASK_COMPLETE):
             execution_result = "success"
+            # A control tag is genuine progress — reset stagnation counters so a
+            # multi-task goal isn't flagged stuck just because individual tasks
+            # complete without a coordinate action on that step.
+            self._last_success_time = time.perf_counter()
+            self._consecutive_failures = 0
+            self._steps_without_progress = 0
+            self._retry_attempted = False
         else:
             execution_result = self.execute_action(action)
+            # Reset stagnation counters on successful action execution
+            if execution_result == "success":
+                self._last_success_time = time.perf_counter()
+                self._consecutive_failures = 0
+                self._steps_without_progress = 0
+                self._retry_attempted = False
 
         _t0 = time.perf_counter()
         try:
@@ -539,8 +1099,13 @@ class Coordinator(QObject):
         _perf.info("[latency] step=%d db_log=%.3fs", self.current_step, time.perf_counter() - _t0)
         _perf.info("[latency] step=%d total_step=%.3fs", self.current_step, time.perf_counter() - _t0_step)
 
-        # Return True on DONE, False to continue iterating.
-        return action is not None and action.action_type == ActionType.DONE
+        # Surface control outcomes (DONE / TASK_COMPLETE) so run_loop can either
+        # finish the goal or advance the plan to the next task.
+        if action is not None and action.action_type in (
+            ActionType.DONE, ActionType.TASK_COMPLETE
+        ):
+            return action.action_type
+        return None
 
     # ------------------------------------------------------------------
     # History context builder
@@ -595,7 +1160,7 @@ class Coordinator(QObject):
         return context
 
     # ------------------------------------------------------------------
-    # AI response provider (mock for Phase 4, real in Phase 5)
+    # AI response provider (mock script or real vision API)
     # ------------------------------------------------------------------
 
     def get_ai_response(self) -> str:
@@ -626,6 +1191,43 @@ class Coordinator(QObject):
             return response
 
         return self._call_grok_api()
+
+    def _build_plan_context(self) -> str:
+        """
+        Render the current plan (goal, task checklist with the active task
+        marked) plus the [TASK_COMPLETE] instruction and any reflection hint,
+        for injection into the per-step API request.
+
+        Returns an empty string if there is no plan.
+        """
+        plan = self.current_plan
+        if plan is None or not plan.tasks:
+            return ""
+
+        lines = ["Plan progress:"]
+        for i, task in enumerate(plan.tasks):
+            marker = "→" if i == plan.current_index else (
+                "✓" if i < plan.current_index else " "
+            )
+            lines.append(f"  {marker} {i + 1}. {task.description}")
+
+        if plan.current_index < len(plan.tasks):
+            current = plan.tasks[plan.current_index].description
+            lines.append(f"\nFocus on the current task (marked →): {current}")
+            lines.append(
+                "When this specific task is finished, emit [TASK_COMPLETE] to "
+                "advance to the next task. Emit [DONE] only when the entire goal "
+                "is achieved."
+            )
+
+        if self.current_reflection is not None:
+            lines.append(
+                f"\nNote from self-diagnosis — avoid repeating the failed "
+                f"approach ({self.current_reflection.failed_strategy}). "
+                f"Recommended: {self.current_reflection.recommendation}"
+            )
+
+        return "\n".join(lines) + "\n\n"
 
     def _call_grok_api(self) -> str:
         """
@@ -673,6 +1275,8 @@ class Coordinator(QObject):
             else ""
         )
 
+        plan_note = self._build_plan_context()
+
         messages = [
             {"role": "system", "content": self._system_prompt},
             {
@@ -682,7 +1286,8 @@ class Coordinator(QObject):
                         "type": "text",
                         "text": (
                             f"{history_note}"
-                            f"Current command: {self.current_command}"
+                            f"{plan_note}"
+                            f"Overall goal: {self.current_command}"
                         ),
                     },
                     {

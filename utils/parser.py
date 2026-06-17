@@ -1,5 +1,5 @@
 """
-Phase 4: Action Tag Parser
+Action Tag Parser
 
 Extracts structured action descriptors from the free-text responses that Grok
 Vision returns.  The convention is that each response contains at most ONE
@@ -10,7 +10,8 @@ Supported tags:
     [TYPE:x,y|text_to_type]      — focus field at (x, y) then paste text
     [PRESS:key_name]             — press a named key (enter, tab, esc, …)
     [SCROLL:direction:amount]    — scroll the wheel (down:3, up:300, …)
-    [DONE]                       — task complete, no further action needed
+    [TASK_COMPLETE]              — current plan task finished, advance to next task
+    [DONE]                       — whole goal complete, no further action needed
 
 Parsing is lenient about the bracket wrapper but strict about the payload:
     - Smaller models frequently drop the opening "[" and/or closing "]"
@@ -37,11 +38,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class ActionType(str, Enum):
-    CLICK  = "CLICK"
-    TYPE   = "TYPE"
-    PRESS  = "PRESS"
-    SCROLL = "SCROLL"
-    DONE   = "DONE"
+    CLICK         = "CLICK"
+    TYPE          = "TYPE"
+    PRESS         = "PRESS"
+    SCROLL        = "SCROLL"
+    TASK_COMPLETE = "TASK_COMPLETE"
+    DONE          = "DONE"
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +89,8 @@ class ParsedAction:
             return f"[PRESS:{self.key}]"
         if self.action_type == ActionType.SCROLL:
             return f"[SCROLL:{self.direction}:{self.amount}]"
+        if self.action_type == ActionType.TASK_COMPLETE:
+            return "[TASK_COMPLETE]"
         return "[DONE]"
 
 
@@ -131,7 +135,7 @@ _RE_SCROLL = re.compile(_lenient(_P_SCROLL), re.IGNORECASE)
 _RE_ANY_TAG = re.compile(
     "|".join(
         [_lenient(p) for p in (_P_CLICK, _P_TYPE, _P_PRESS, _P_SCROLL)]
-        + [r"\[DONE\]", r"\bDONE\s*$"]
+        + [r"\[TASK_COMPLETE\]", r"\[DONE\]", r"\bDONE\s*$"]
     ),
     re.IGNORECASE,
 )
@@ -236,6 +240,9 @@ class ActionParser:
         # The opening bracket may be absent (lenient extraction); strip it so
         # the prefix dispatch below works either way.
         tag_upper = tag.upper().strip().lstrip("[")
+
+        if "TASK_COMPLETE" in tag_upper:
+            return ParsedAction(action_type=ActionType.TASK_COMPLETE)
 
         if "DONE" in tag_upper:
             return ParsedAction(action_type=ActionType.DONE)

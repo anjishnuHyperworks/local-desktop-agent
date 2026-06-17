@@ -1,5 +1,5 @@
 """
-Phase 3: Screen Capture
+Screen Capture
 
 Captures the primary monitor using mss and exposes the result as a PIL Image,
 JPEG bytes, or a Base64-encoded UTF-8 string ready for API payloads.

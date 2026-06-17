@@ -134,7 +134,7 @@ def _validate_environment(logger: logging.Logger) -> bool:
 
 # ---------------------------------------------------------------------------
 # PyAutoGUI failsafe — compatibility cue only.
-# The primary emergency abort is the pynput Esc listener (implemented in Phase 2+).
+# The primary emergency abort is the pynput Esc listener in the Spotlight UI.
 # ---------------------------------------------------------------------------
 def _init_pyautogui_failsafe() -> None:
     try:
@@ -185,7 +185,7 @@ def main() -> None:
         )
 
     # ------------------------------------------------------------------
-    # Phase 2 + 4: Qt application + Spotlight UI + Coordinator
+    # Qt application + Spotlight UI + HUD + Coordinator
     # ------------------------------------------------------------------
     from PyQt6.QtWidgets import QApplication
     from PyQt6.QtCore import Qt, QThread
@@ -279,7 +279,7 @@ def main() -> None:
     app.aboutToQuit.connect(_shutdown)
 
     logger.info(
-        "Phase 5 ready — Coordinator wired up (use_mock_ai=False). "
+        "Ready — Coordinator wired up (use_mock_ai=False). "
         "Press Ctrl+Space to open the spotlight."
     )
     sys.exit(app.exec())

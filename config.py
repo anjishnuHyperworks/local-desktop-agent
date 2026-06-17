@@ -37,9 +37,18 @@ JPEG_QUALITY: int = 85              # Compression quality for API payloads
 # ---------------------------------------------------------------------------
 # Execution loop
 # ---------------------------------------------------------------------------
-MAX_STEPS_PER_COMMAND: int = 6     # Hard limit — prevents runaway loops
+MAX_STEPS_PER_COMMAND: int = 15    # Soft working budget — protects latency, responsiveness, API cost
+MAX_ACTIONS: int = 120              # Absolute runaway-protection ceiling — structural safety
 UI_HIDE_DELAY_MS: int = 250         # ms to wait after hiding UI before first capture
 STEP_DELAY_S: float = 0.5           # Pause between consecutive action steps (seconds)
+
+# ---------------------------------------------------------------------------
+# Long-horizon planning / reflection / replanning
+# ---------------------------------------------------------------------------
+MAX_REPLANS: int = 5                       # Hard ceiling on replanning cycles before failing
+MAX_STUCK_TIME_S: float = 45.0             # Temporal stagnation: no successful action for this long
+MAX_SEMANTIC_STAGNATION_STEPS: int = 8     # Semantic stagnation: steps without state advancement
+MAX_CONSECUTIVE_FAILURES: int = 5          # Consecutive failed actions before recovery
 
 # ---------------------------------------------------------------------------
 # Input emulation timing (Windows-specific)

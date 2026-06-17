@@ -7,6 +7,32 @@ It synthesizes the original modular layout with structural reliability enhanceme
 
 The development follows a safety-first, bottom-up + integration approach to minimize bugs and allow early testing.
 
+> ### ⚠ Implementation Status (reconciled 2026-06-17)
+>
+> This document is the **aspirational** production plan. The shipped codebase
+> deliberately tracks a lighter-weight design (see
+> `Architecture Clarifications & Reconciliations`), so several hardening
+> features below are **deferred, not built**. Statuses are annotated per phase.
+> Treat unbuilt items as a future roadmap, not as missing work.
+>
+> **Built:** DPI bootstrap, Spotlight UI + Status HUD, screen capture, absolute
+> coordinate remapping, input emulator, action parser, the capture→reason→act
+> coordinator loop, SQLite interaction logging, and a lightweight
+> planner / reflection / replanning layer (`Plan`, `Task`, `ReflectionResult`,
+> `AgentMode`) with `[TASK_COMPLETE]` task progression.
+>
+> **Deferred (in plan, not in code):** versioned append-only `EventStore` with
+> WAL + `schema_info`, `core/safety.py` (`ApiCircuitBreaker`, threaded
+> `Watchdog`), deterministic failure fingerprinting, frequency-based
+> oscillation detection, action-dedup guard, `resume_session()` crash recovery,
+> and the advanced-safety constants in §3 below.
+>
+> **Diverged on purpose:** persistence is `core/database.py`
+> (`InteractionDatabase`), not `EventStore`; WAL is intentionally *not* used
+> (per-operation connections + a write lock serialise access instead); the
+> model is `gpt-5.4` via the aicredits gateway, not xAI Grok; `MAX_IMAGE_SIZE`
+> is 1920, not 1280.
+
 **Goal**: Create a working Python application that:
 - Activates via `Ctrl+Space`
 - Shows a floating Spotlight-style input plus a non-intrusive Status HUD
@@ -33,6 +59,15 @@ The development follows a safety-first, bottom-up + integration approach to mini
 - Obtain the xAI Grok API key and store it securely (e.g., environment variable `GROK_API_KEY`).
 
 ### 3. Required Configurations (`config.py`)
+
+> **Status — ⚠ Partial.** Of the thresholds below, only `MAX_ACTIONS`,
+> `MAX_REPLANS`, `MAX_CONSECUTIVE_FAILURES`, `MAX_STUCK_TIME`
+> (as `MAX_STUCK_TIME_S`) and `MAX_SEMANTIC_STAGNATION_STEPS` exist in the
+> current `config.py`. The circuit-breaker, watchdog, oscillation, EventStore,
+> runtime/timeout, and escalation-cooldown constants are **not defined** —
+> their subsystems are deferred. Note `MAX_IMAGE_SIZE` is **1920** in the code,
+> not 1280.
+
 Define these exact production thresholds:
 ```python
 # Hard Loop Budgets
@@ -66,6 +101,12 @@ Plus existing UI/image constants (e.g., `MAX_IMAGE_SIZE=1280`, `UI_HIDE_DELAY_MS
 
 ## Phase 1: Core Architecture & Safety Primitives
 
+> **Status — ⚠ Partial.** Directory structure, `config.py`, and the DPI-aware
+> `main.py` bootstrap (step 3) are **built** and treated as protected
+> invariants. `pyautogui.FAILSAFE = True` is set. The `ApiCircuitBreaker` and
+> threaded `Watchdog` (steps 4–5, `core/safety.py`) are **not implemented** —
+> `core/safety.py` does not exist.
+
 **Objective**: Establish the hardened configuration, process environment context, and standalone safety utility layers.
 
 **Steps for LLM**:
@@ -81,6 +122,16 @@ Plus existing UI/image constants (e.g., `MAX_IMAGE_SIZE=1280`, `UI_HIDE_DELAY_MS
 ---
 
 ## Phase 2: Atomic Data Layer & Versioned Event Store
+
+> **Status — ⚠ Diverged / Partial.** Persistence exists as
+> `core/database.py` (`InteractionDatabase`), a thread-safe SQLite interaction
+> log — **not** the versioned append-only `EventStore` this phase specifies.
+> No `schema_info` / `STATE_SCHEMA_VERSION`, no FSM `transition_to()` records,
+> no `MAX_EVENTSTORE_ENTRIES` / `MAX_SCREENSHOT_HISTORY` bounding. **WAL is
+> intentionally not used** — per-operation connections plus a `threading.Lock`
+> serialise writes instead (documented in `database.py`). The `AgentMode` FSM
+> enum exists in `core/coordinator.py`, but `CRASHED` / `FAILED` are never
+> assigned and transitions are not logged.
 
 **Objective**: Build a thread-safe, append-only persistence layer supporting atomic state writes, structural forensics, and crash recovery.
 
@@ -103,6 +154,11 @@ Plus existing UI/image constants (e.g., `MAX_IMAGE_SIZE=1280`, `UI_HIDE_DELAY_MS
 
 ## Phase 3: Modern Spotlight UI & Status HUD
 
+> **Status — ✅ Built.** `ui/spotlight.py` and `ui/hud.py` exist with the
+> hotkey-activated Spotlight, `pyqtSignal`-based threading, and the click-through
+> HUD. Verify the Win32 focus injection (step 3) and `WDA_EXCLUDEFROMCAPTURE`
+> (step 4) details against the current widgets if relying on them.
+
 **Objective**: Implement the hotkey-activated query input and non-intrusive runtime overlay widgets.
 
 **Steps for LLM**:
@@ -117,6 +173,12 @@ Plus existing UI/image constants (e.g., `MAX_IMAGE_SIZE=1280`, `UI_HIDE_DELAY_MS
 ---
 
 ## Phase 4: OS Automation & Absolute Remapping
+
+> **Status — ✅ Built (one constant differs).** `automation/capture.py`,
+> `utils/image_processor.py` (absolute inverse remapping via stored
+> `scale_x` / `scale_y`), and `automation/input_emulator.py` (click/type/press/
+> scroll, focus-to-type delay, scroll normalisation) are all implemented. The
+> resize cap is **1920px** (`MAX_IMAGE_SIZE`), not the 1280px written below.
 
 **Objective**: Implement precision screen interaction utilities working in absolute coordinates.
 
@@ -142,6 +204,15 @@ Plus existing UI/image constants (e.g., `MAX_IMAGE_SIZE=1280`, `UI_HIDE_DELAY_MS
 ---
 
 ## Phase 5: The Cognitive Execution Engine
+
+> **Status — ⚠ Partial.** The parser (step 1, now also `[TASK_COMPLETE]`) and
+> multi-turn inference with text history + image only in the final user frame
+> (step 5, loading `prompts/system_prompt.txt`) are **built**. Deterministic
+> fingerprinting (step 2), frequency-based oscillation tracking (step 3), and
+> the action-deduplication guard (step 4) are **not implemented**. In their
+> place the coordinator has a lightweight planner / `reflect()` / `replan()`
+> recovery layer (from the addendum) driving the `AgentMode` escalation
+> NORMAL → LOCAL_RETRY → REFLECTING → REPLANNING.
 
 **Objective**: Construct the unified coordination loop managing inference processing and deterministic error checking.
 
@@ -169,6 +240,15 @@ Plus existing UI/image constants (e.g., `MAX_IMAGE_SIZE=1280`, `UI_HIDE_DELAY_MS
 
 ## Phase 6: Full Integration & Watchdog Telemetry
 
+> **Status — ⚠ Partial.** The single-QThread worker lifecycle (step 1), the
+> multi-step Capture→reason→execute→log→HUD loop with `[DONE]` / `MAX_ACTIONS` /
+> `MAX_STEPS_PER_COMMAND` / abort breaks (step 2), the 250ms post-hide delay
+> (step 3), and the dual stagnation check (step 5) are **built**. The watchdog
+> telemetry hooks / `handle_watchdog_crash` (step 4) and `resume_session()`
+> crash recovery (step 6) are **not implemented** — there is no watchdog and no
+> session resume. Note the loop also enforces `MAX_STEPS_PER_COMMAND` (a soft
+> per-command budget) not listed in the original step 2.
+
 **Objective**: Combine subsystems into a robust execution loop that can recover from crashes.
 
 **Steps for LLM**:
@@ -192,6 +272,14 @@ Plus existing UI/image constants (e.g., `MAX_IMAGE_SIZE=1280`, `UI_HIDE_DELAY_MS
 ---
 
 ## Phase 7: Production Rigor & Verification Scenarios
+
+> **Status — ⚠ Deferred.** Most scenarios below exercise subsystems that are
+> not built (circuit breaker, watchdog, oscillation, dedup, crash resume,
+> `WDA_EXCLUDEFROMCAPTURE`) and are therefore **not yet applicable**. The
+> coordinate-accuracy, clipboard/focus/scroll, and `Esc`-abort scenarios *are*
+> relevant to the current build. The README exists but is **outdated** — it
+> predates the model switch (aicredits `gpt-5.4`), the planner layer, and the
+> 1920px image cap; refresh it before relying on it.
 
 **Objective**: Validate system performance under real-world operating conditions and failure states.
 

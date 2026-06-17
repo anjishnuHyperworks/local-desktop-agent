@@ -1,5 +1,5 @@
 """
-Phase 4: Image Processor
+Image Processor
 
 Resizes raw screenshot bytes for API transmission and provides the coordinate
 helper that maps the model's resized-image pixel coordinates back onto physical
@@ -10,8 +10,8 @@ Design decisions:
 - Aspect ratio is always preserved; the longer dimension is capped at MAX_IMAGE_SIZE.
 - ProcessedImage carries both original and resized dimensions so the caller can
   compute scale factors without re-opening the buffer.
-- Coordinate normalisation lives here (not in InputEmulator) so Phase 4 tests
-  can validate the maths without instantiating Win32-dependent objects.
+- Coordinate normalisation lives here (not in InputEmulator) so tests can
+  validate the maths without instantiating Win32-dependent objects.
 """
 
 import io

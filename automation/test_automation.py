@@ -1,5 +1,5 @@
 """
-Phase 3 — Standalone Test Utility
+Standalone Automation Test Utility
 
 Exercises every public component of ScreenCapture and InputEmulator
 sequentially.  Safe to run at any time: the DPI movement test visits

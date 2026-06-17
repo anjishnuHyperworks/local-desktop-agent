@@ -1,5 +1,5 @@
 """
-Phase 2: Floating Spotlight UI
+Floating Spotlight UI
 
 A borderless, semi-transparent Spotlight/Raycast-style input window triggered by
 Ctrl+Space. All pynput-to-Qt cross-thread communication goes through pyqtSignal so
@@ -9,7 +9,7 @@ Threading model:
   - pynput GlobalHotKeys runs in its own daemon thread (never touches Qt directly).
   - It emits _show_signal / _hide_signal which are queued across thread boundaries.
   - The Esc abort listener runs in a second pynput thread; it emits _abort_signal.
-  - The coordinator (added in Phase 4) connects to command_submitted and abort_requested.
+  - The coordinator connects to command_submitted and abort_requested.
 """
 
 import html
@@ -315,6 +315,16 @@ class SpotlightWindow(QWidget):
         text = self._input.text().strip()
         if not text:
             return
+
+        # Quit keywords break any running loop and shut the program down.
+        # _shutdown (wired to app.aboutToQuit in main) stops the coordinator,
+        # joins the worker thread and closes the DB, so quit() is sufficient.
+        if text.lower() in ("exit", "quit"):
+            logger.info("Quit keyword %r received — shutting down", text)
+            self.abort_requested.emit()   # break the loop if one is running
+            QApplication.quit()
+            return
+
         logger.info("Command submitted: %r", text)
         # Stay visible in a "thinking" state until the coordinator classifies
         # the intent: chat answers render in the response panel, automation
