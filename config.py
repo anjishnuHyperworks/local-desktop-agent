@@ -28,10 +28,15 @@ GROK_MODEL: str = "openai/gpt-5.5"
 # ---------------------------------------------------------------------------
 # Image / coordinate normalisation
 # ---------------------------------------------------------------------------
-MAX_IMAGE_SIZE: int = 1920          # Maximum dimension (px) sent to the model.
+MAX_IMAGE_SIZE: int = 960           # Maximum dimension (px) sent to the model.
                                     # The model reports coordinates in this
                                     # resized-image pixel space; the coordinator
                                     # converts them back to physical screen px.
+                                    # Set below the common 1920px display width so
+                                    # the resize actually engages: halving the
+                                    # longest side cuts vision tokens ~2-2.5x. Do
+                                    # not drop much lower or small on-screen buttons
+                                    # become too imprecise to click reliably.
 JPEG_QUALITY: int = 85              # Compression quality for API payloads
 
 # ---------------------------------------------------------------------------
