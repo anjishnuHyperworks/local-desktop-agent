@@ -167,19 +167,39 @@ class InputEmulator:
                 self._keyboard.release("v")
             time.sleep(config.CLIPBOARD_PASTE_DELAY_S)
 
-    def type_at_coordinates(self, physical_x: int, physical_y: int, text: str) -> None:
+    def type_at_coordinates(
+        self,
+        physical_x: int,
+        physical_y: int,
+        text: str,
+        *,
+        replace: bool = True,
+    ) -> None:
         """
         Click to focus (physical-pixel coordinates), wait for Windows to register
         the focus event, then paste text.  The focus delay is mandatory — omitting
         it causes Windows to drop the first few characters of the paste on slower
         machines.
+
+        When ``replace`` is True (the default) the existing field contents are
+        selected (Ctrl+A) before pasting, so the new text *overwrites* rather than
+        being inserted at the caret. Without this, clicking into a populated field
+        (e.g. a Colab title reading "Untitled16.ipynb") drops the caret mid-text
+        and the paste yields corruption like "Untitled1<new>6.ipynb". Pass
+        replace=False to append instead (e.g. typing into a code cell).
         """
         logger.info(
-            "type_at_coordinates: (%d, %d), text length=%d",
-            physical_x, physical_y, len(text),
+            "type_at_coordinates: (%d, %d), text length=%d, replace=%s",
+            physical_x, physical_y, len(text), replace,
         )
         self.click_at(physical_x, physical_y)
         time.sleep(config.FOCUS_REGISTRATION_DELAY_S)
+        if replace:
+            # Select all existing field contents so the paste overwrites them.
+            with self._keyboard.pressed(Key.ctrl):
+                self._keyboard.press("a")
+                self._keyboard.release("a")
+            time.sleep(config.SELECT_ALL_DELAY_S)
         self.type_string(text)
 
     # ------------------------------------------------------------------

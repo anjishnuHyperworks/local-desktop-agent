@@ -23,7 +23,7 @@ SYSTEM_PROMPT_PATH = PROMPTS_DIR / "system_prompt.txt"
 # ---------------------------------------------------------------------------
 GROK_API_KEY: str = os.environ.get("AICREDITS_API_KEY", "")
 GROK_API_URL: str = "https://api.aicredits.in/v1/chat/completions"
-GROK_MODEL: str = "anthropic/claude-sonnet-4.5"
+GROK_MODEL: str = "openai/gpt-4o-mini"
 
 # ---------------------------------------------------------------------------
 # Image / coordinate normalisation
@@ -69,6 +69,7 @@ PLANNER_MAX_ATTEMPTS: int = 2              # Total attempts (initial + retries) 
 MAX_STUCK_TIME_S: float = 45.0             # Temporal stagnation: no successful action for this long
 MAX_SEMANTIC_STAGNATION_STEPS: int = 8     # Semantic stagnation: steps without state advancement
 MAX_CONSECUTIVE_FAILURES: int = 5          # Consecutive failed actions before recovery
+MAX_IDENTICAL_ACTIONS: int = 3             # Identical action issued this many times in a row → forced recovery (no re-dispatch)
 
 # ---------------------------------------------------------------------------
 # Input emulation timing (Windows-specific)
@@ -76,6 +77,7 @@ MAX_CONSECUTIVE_FAILURES: int = 5          # Consecutive failed actions before r
 CLICK_MOVE_DURATION_S: float = 0.30    # Smooth mouse movement duration
 FOCUS_REGISTRATION_DELAY_S: float = 0.15  # Delay after click before typing
 CLIPBOARD_PASTE_DELAY_S: float = 0.10    # Delay after Ctrl+V for Windows paste
+SELECT_ALL_DELAY_S: float = 0.05         # Delay after Ctrl+A before overwriting a field
 
 # ---------------------------------------------------------------------------
 # Scroll unit normalisation

@@ -44,6 +44,7 @@ AI modes:
 """
 
 import base64
+import hashlib
 import json
 import logging
 import time
@@ -57,6 +58,7 @@ import httpx
 from PyQt6.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
 
 import config
+from automation.app_launcher import AppLauncher
 from automation.capture import ScreenCapture
 from automation.input_emulator import InputEmulator
 from core.database import InteractionDatabase
@@ -177,6 +179,7 @@ class Coordinator(QObject):
         self._parser = ActionParser()
         self._screen_capture = ScreenCapture()
         self._input_emulator = InputEmulator()
+        self._app_launcher = AppLauncher()
 
         # -- Execution state --------------------------------------------------
         self.is_running: bool = False
@@ -214,6 +217,26 @@ class Coordinator(QObject):
         # physical screen pixels. 1.0 means "image not resized / identity".
         self._last_scale_x: float = 1.0
         self._last_scale_y: float = 1.0
+
+        # Perceptual hash of the screenshot captured for the *current* step.
+        # _call_grok_api refreshes this every time it captures a frame; the loop
+        # compares it against the prior step's hash to tell whether an action
+        # actually changed the screen. A click that lands on empty space leaves
+        # the screen identical → no real progress, even though the input event
+        # "succeeded". This is what lets the stagnation guards catch the
+        # oscillation loop instead of resetting on every dispatched click.
+        self._current_frame_hash: Optional[str] = None
+        self._prev_frame_hash: Optional[str] = None
+
+        # Identical-action run-length guard. The model (any model — Sonnet and
+        # GPT-5.4 both did it) will re-issue the exact same click several times
+        # while narrating "let me try a different spot". The advisory note in the
+        # history context does not reliably stop it, so we track the last
+        # coordinate action tag and how many times in a row it has been issued;
+        # once it hits MAX_IDENTICAL_ACTIONS we refuse to dispatch it again and
+        # force the stagnation/recovery escalation instead.
+        self._last_coord_action_tag: Optional[str] = None
+        self._identical_action_count: int = 0
 
         # -- Mock AI script ---------------------------------------------------
         # Cycled through in order; after exhaustion [DONE] is returned.
@@ -883,6 +906,14 @@ class Coordinator(QObject):
                 self.status_signal.emit("Opening a new browser tab...")
                 self._input_emulator.open_new_browser_tab()
 
+            elif action.action_type == ActionType.LAUNCH:
+                self.status_signal.emit(f"Launching {action.text}...")
+                self._app_launcher.launch_app(action.text)
+
+            elif action.action_type == ActionType.OPEN_URL:
+                self.status_signal.emit(f"Opening {action.text}...")
+                self._app_launcher.open_url(action.text)
+
             _perf.info("[latency] action_execution(%s)=%.3fs", action.action_type.name, time.perf_counter() - _t0)
             return "success"
 
@@ -977,6 +1008,10 @@ class Coordinator(QObject):
         self._steps_without_progress = 0
         self._consecutive_waits = 0
         self._retry_attempted = False   # escalation stage: LOCAL_RETRY → REFLECTING
+        self._last_coord_action_tag = None
+        self._identical_action_count = 0
+        self._prev_frame_hash = None
+        self._current_frame_hash = None
 
         # Outcome marker for last-command memory. _handle_step_outcome flips this
         # to True on genuine completion; any other exit (budget, abort, error,
@@ -1284,14 +1319,69 @@ class Coordinator(QObject):
                     self._consecutive_waits,
                 )
         else:
-            execution_result = self.execute_action(action)
-            self._consecutive_waits = 0
-            # Reset stagnation counters on successful action execution
-            if execution_result == "success":
-                self._last_success_time = time.perf_counter()
-                self._consecutive_failures = 0
-                self._steps_without_progress = 0
-                self._retry_attempted = False
+            # -- Identical-action enforcement -------------------------------
+            # Track how many times this exact coordinate action has been issued
+            # back-to-back. Once it reaches the ceiling, stop dispatching it: a
+            # click that has already failed N times will not start working on
+            # attempt N+1. Instead, push the semantic-stagnation counter over the
+            # edge so the loop's existing LOCAL_RETRY → REFLECTING escalation
+            # takes over and forces a genuinely different approach.
+            if action_tag_str == self._last_coord_action_tag:
+                self._identical_action_count += 1
+            else:
+                self._identical_action_count = 1
+                self._last_coord_action_tag = action_tag_str
+
+            if self._identical_action_count >= config.MAX_IDENTICAL_ACTIONS:
+                # Blocked path: do NOT dispatch the input, do NOT count it as
+                # progress. Trip the semantic-stagnation guard so the next
+                # _check_stagnation() forces recovery.
+                logger.warning(
+                    "process_single_step: blocking identical action %s "
+                    "(issued %d× in a row) — forcing recovery instead of "
+                    "re-dispatching",
+                    action_tag_str, self._identical_action_count,
+                )
+                self.status_signal.emit(
+                    "Repeated action had no effect — changing approach"
+                )
+                execution_result = "blocked"
+                self._steps_without_progress = (
+                    config.MAX_SEMANTIC_STAGNATION_STEPS + 1
+                )
+                self._consecutive_waits = 0
+                # Reset the run-length so we start fresh after recovery.
+                self._identical_action_count = 0
+                self._last_coord_action_tag = None
+            else:
+                execution_result = self.execute_action(action)
+                self._consecutive_waits = 0
+                # A dispatched input event returns "success" even when it changed
+                # nothing on screen (a click on empty space, a misfired target).
+                # To avoid resetting the stagnation guards on such no-ops, only
+                # treat a coordinate action as progress if the screen actually
+                # moved since the previous step. The hash captured at the start
+                # of THIS step reflects the result of the PREVIOUS action, so
+                # comparing it to the prior frame tells us whether forward motion
+                # is happening at all.
+                screen_changed = (
+                    self._prev_frame_hash is None
+                    or self._current_frame_hash != self._prev_frame_hash
+                )
+                if execution_result == "success" and screen_changed:
+                    self._last_success_time = time.perf_counter()
+                    self._consecutive_failures = 0
+                    self._steps_without_progress = 0
+                    self._retry_attempted = False
+                elif execution_result == "success" and not screen_changed:
+                    # Input dispatched but the screen is unchanged → no real
+                    # progress. Let the semantic-stagnation counter climb.
+                    self._steps_without_progress += 1
+                    logger.info(
+                        "process_single_step: action %s left the screen "
+                        "unchanged — steps_without_progress=%d",
+                        action_tag_str, self._steps_without_progress,
+                    )
 
         _t0 = time.perf_counter()
         try:
@@ -1521,6 +1611,12 @@ class Coordinator(QObject):
             # image-pixel coordinates back to physical screen pixels.
             self._last_scale_x = processed.scale_x
             self._last_scale_y = processed.scale_y
+
+            # Roll the frame-hash window forward: this step's hash becomes the
+            # baseline the *next* step diffs against. process_single_step reads
+            # both to decide whether the previous action changed anything.
+            self._prev_frame_hash = self._current_frame_hash
+            self._current_frame_hash = hashlib.md5(processed.image_bytes).hexdigest()
 
             logger.info(
                 "_call_grok_api: image captured — original=%dx%d, "

@@ -44,6 +44,8 @@ class ActionType(str, Enum):
     SCROLL        = "SCROLL"
     WAIT          = "WAIT"
     NEW_TAB       = "NEW_TAB"
+    LAUNCH        = "LAUNCH"
+    OPEN_URL      = "OPEN_URL"
     TASK_COMPLETE = "TASK_COMPLETE"
     DONE          = "DONE"
 
@@ -59,12 +61,14 @@ class ParsedAction:
 
     Fields are populated according to action_type; unused fields are None.
 
-    CLICK:  x, y
-    TYPE:   x, y, text
-    PRESS:  key
-    SCROLL: direction, amount
-    WAIT:   seconds (optional)
-    DONE:   (no additional fields)
+    CLICK:    x, y
+    TYPE:     x, y, text
+    PRESS:    key
+    SCROLL:   direction, amount
+    WAIT:     seconds (optional)
+    LAUNCH:   text  (the app name)
+    OPEN_URL: text  (the URL)
+    DONE:     (no additional fields)
     """
 
     action_type: ActionType
@@ -99,6 +103,10 @@ class ParsedAction:
             return f"[WAIT:{self.seconds:g}]" if self.seconds is not None else "[WAIT]"
         if self.action_type == ActionType.NEW_TAB:
             return "[NEW_TAB]"
+        if self.action_type == ActionType.LAUNCH:
+            return f"[LAUNCH:{self.text}]"
+        if self.action_type == ActionType.OPEN_URL:
+            return f"[OPEN_URL:{self.text}]"
         if self.action_type == ActionType.TASK_COMPLETE:
             return "[TASK_COMPLETE]"
         return "[DONE]"
@@ -120,6 +128,14 @@ _P_CLICK  = r"CLICK:\s*(\d+)\s*,\s*(\d+)"
 _P_TYPE   = r"TYPE:\s*(\d+)\s*,\s*(\d+)\s*\|"
 _P_PRESS  = r"PRESS:\s*([\w\-]+)"
 _P_SCROLL = r"SCROLL:\s*(up|down|left|right)\s*:\s*(\d+)"
+# LAUNCH app name: greedy run of everything that is not "]" or a line break, up
+# to the closing bracket / EOL. Greedy (not lazy) so multi-word names like
+# "google chrome" are captured whole rather than collapsing to one char when the
+# trailing "]" is optional. Trailing whitespace is trimmed in _decode_launch.
+_P_LAUNCH = r"LAUNCH:\s*([^\]\r\n]+)"
+# OPEN_URL: everything up to a closing bracket or whitespace/EOL. URLs contain
+# ":/.?=&%#" etc. but never a literal "]" or whitespace, so stop at those.
+_P_OPENURL = r"OPEN_URL:\s*([^\]\s]+)"
 # WAIT takes an optional ":seconds" argument (e.g. [WAIT] or [WAIT:2.5]).
 _P_WAIT   = r"WAIT(?:\s*:\s*(\d+(?:\.\d+)?))?"
 # Stricter WAIT form used only by the combined any-tag scanner: a bare,
@@ -180,6 +196,10 @@ _RE_SCROLL = re.compile(_lenient(_P_SCROLL), re.IGNORECASE)
 # Capture group: seconds (optional)
 _RE_WAIT = re.compile(_lenient(_P_WAIT), re.IGNORECASE)
 
+# Capture group: app name / URL
+_RE_LAUNCH = re.compile(_lenient(_P_LAUNCH), re.IGNORECASE)
+_RE_OPENURL = re.compile(_lenient(_P_OPENURL), re.IGNORECASE)
+
 # Single pattern that matches ANY known tag (for extract_action_tag /
 # remove_action_tag). DONE keeps its stricter form: brackets required unless
 # it is the bare final word of the response. TYPE is anchored to the end of the
@@ -187,7 +207,7 @@ _RE_WAIT = re.compile(_lenient(_P_WAIT), re.IGNORECASE)
 # swallow other tags; it is therefore tried last in the alternation.
 _RE_ANY_TAG = re.compile(
     "|".join(
-        [_lenient(p) for p in (_P_CLICK, _P_PRESS, _P_SCROLL)]
+        [_lenient(p) for p in (_P_CLICK, _P_PRESS, _P_SCROLL, _P_OPENURL, _P_LAUNCH)]
         + [_P_WAIT_STRICT]
         + [r"\[\s*NEW_TAB\s*\]", r"\[TASK_COMPLETE\]", r"\[DONE\]", r"\bDONE\s*$"]
         + [_lenient_type(_P_TYPE)]
@@ -320,6 +340,12 @@ class ActionParser:
         if tag_upper.startswith("WAIT"):
             return self._decode_wait(tag)
 
+        if tag_upper.startswith("OPEN_URL:"):
+            return self._decode_open_url(tag)
+
+        if tag_upper.startswith("LAUNCH:"):
+            return self._decode_launch(tag)
+
         logger.warning("_decode_tag: unrecognised tag prefix: %r", tag)
         return None
 
@@ -412,6 +438,28 @@ class ActionParser:
                 logger.warning("Non-numeric duration in WAIT tag: %r", tag)
                 seconds = None
         return ParsedAction(action_type=ActionType.WAIT, seconds=seconds)
+
+    def _decode_launch(self, tag: str) -> Optional[ParsedAction]:
+        m = _RE_LAUNCH.fullmatch(tag)
+        if m is None:
+            logger.warning("Malformed LAUNCH tag: %r", tag)
+            return None
+        name = m.group(1).strip()
+        if not name:
+            logger.warning("Empty app name in LAUNCH tag: %r", tag)
+            return None
+        return ParsedAction(action_type=ActionType.LAUNCH, text=name)
+
+    def _decode_open_url(self, tag: str) -> Optional[ParsedAction]:
+        m = _RE_OPENURL.fullmatch(tag)
+        if m is None:
+            logger.warning("Malformed OPEN_URL tag: %r", tag)
+            return None
+        url = m.group(1).strip()
+        if not url:
+            logger.warning("Empty URL in OPEN_URL tag: %r", tag)
+            return None
+        return ParsedAction(action_type=ActionType.OPEN_URL, text=url)
 
     # ------------------------------------------------------------------
     # Utility
