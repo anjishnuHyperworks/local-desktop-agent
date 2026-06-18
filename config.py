@@ -23,7 +23,7 @@ SYSTEM_PROMPT_PATH = PROMPTS_DIR / "system_prompt.txt"
 # ---------------------------------------------------------------------------
 GROK_API_KEY: str = os.environ.get("AICREDITS_API_KEY", "")
 GROK_API_URL: str = "https://api.aicredits.in/v1/chat/completions"
-GROK_MODEL: str = "openai/gpt-4o-mini"
+GROK_MODEL: str = "openai/gpt-5.5"
 
 # ---------------------------------------------------------------------------
 # Image / coordinate normalisation
