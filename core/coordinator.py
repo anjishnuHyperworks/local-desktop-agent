@@ -1610,10 +1610,17 @@ class Coordinator(QObject):
             logger.error("_call_grok_api: request timed out (30s)")
             return fallback
         except httpx.HTTPStatusError as exc:
+            # The response is streamed, so its body isn't read yet. We must
+            # read() it before touching .text, or httpx raises ResponseNotRead.
+            try:
+                exc.response.read()
+                body = exc.response.text[:300]
+            except Exception:
+                body = "<unreadable response body>"
             logger.error(
                 "_call_grok_api: HTTP %d — %s",
                 exc.response.status_code,
-                exc.response.text[:300],
+                body,
             )
             return fallback
         except Exception as exc:
